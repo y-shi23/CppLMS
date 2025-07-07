@@ -1,0 +1,241 @@
+{
+  "users": [
+    {
+      "id": 1,
+      "name": "张三",
+      "email": "zhangsan@example.com",
+      "phone": "13800138001",
+      "address": "北京市朝阳区",
+      "registration_date": "2024-01-15"
+    },
+    {
+      "id": 2,
+      "name": "李四",
+      "email": "lisi@example.com",
+      "phone": "13800138002",
+      "address": "上海市浦东新区",
+      "registration_date": "2024-02-20"
+    },
+    {
+      "id": 3,
+      "name": "王五",
+      "email": "wangwu@example.com",
+      "phone": "13800138003",
+      "address": "广州市天河区",
+      "registration_date": "2024-03-10"
+    },
+    {
+      "id": 4,
+      "name": "赵六",
+      "email": "zhaoliu@example.com",
+      "phone": "13800138004",
+      "address": "深圳市南山区",
+      "registration_date": "2024-04-05"
+    },
+    {
+      "id": 5,
+      "name": "钱七",
+      "email": "qianqi@example.com",
+      "phone": "13800138005",
+      "address": "杭州市西湖区",
+      "registration_date": "2024-05-12"
+    }
+  ],
+  "books": [
+    {
+      "id": 1,
+      "title": "C++程序设计教程",
+      "author": "谭浩强",
+      "isbn": "9787302123456",
+      "publisher": "清华大学出版社",
+      "publication_year": 2023,
+      "category": "计算机科学",
+      "total_copies": 5,
+      "available_copies": 3
+    },
+    {
+      "id": 2,
+      "title": "数据结构与算法分析",
+      "author": "Mark Allen Weiss",
+      "isbn": "9787302234567",
+      "publisher": "机械工业出版社",
+      "publication_year": 2022,
+      "category": "计算机科学",
+      "total_copies": 3,
+      "available_copies": 2
+    },
+    {
+      "id": 3,
+      "title": "操作系统概念",
+      "author": "Abraham Silberschatz",
+      "isbn": "9787302345678",
+      "publisher": "高等教育出版社",
+      "publication_year": 2021,
+      "category": "计算机科学",
+      "total_copies": 4,
+      "available_copies": 4
+    },
+    {
+      "id": 4,
+      "title": "计算机网络",
+      "author": "谢希仁",
+      "isbn": "9787302456789",
+      "publisher": "电子工业出版社",
+      "publication_year": 2023,
+      "category": "计算机科学",
+      "total_copies": 6,
+      "available_copies": 5
+    },
+    {
+      "id": 5,
+      "title": "软件工程导论",
+      "author": "张海藩",
+      "isbn": "9787302567890",
+      "publisher": "清华大学出版社",
+      "publication_year": 2022,
+      "category": "计算机科学",
+      "total_copies": 3,
+      "available_copies": 2
+    },
+    {
+      "id": 6,
+      "title": "高等数学",
+      "author": "同济大学数学系",
+      "isbn": "9787302678901",
+      "publisher": "高等教育出版社",
+      "publication_year": 2023,
+      "category": "数学",
+      "total_copies": 8,
+      "available_copies": 6
+    },
+    {
+      "id": 7,
+      "title": "线性代数",
+      "author": "居余马",
+      "isbn": "9787302789012",
+      "publisher": "清华大学出版社",
+      "publication_year": 2022,
+      "category": "数学",
+      "total_copies": 5,
+      "available_copies": 4
+    },
+    {
+      "id": 8,
+      "title": "概率论与数理统计",
+      "author": "盛骤",
+      "isbn": "9787302890123",
+      "publisher": "高等教育出版社",
+      "publication_year": 2021,
+      "category": "数学",
+      "total_copies": 4,
+      "available_copies": 3
+    },
+    {
+      "id": 9,
+      "title": "大学物理",
+      "author": "马文蔚",
+      "isbn": "9787302901234",
+      "publisher": "高等教育出版社",
+      "publication_year": 2023,
+      "category": "物理学",
+      "total_copies": 7,
+      "available_copies": 6
+    },
+    {
+      "id": 10,
+      "title": "普通化学",
+      "author": "浙江大学",
+      "isbn": "9787303012345",
+      "publisher": "高等教育出版社",
+      "publication_year": 2022,
+      "category": "化学",
+      "total_copies": 5,
+      "available_copies": 5
+    }
+  ],
+  "borrow_records": [
+    {
+      "id": 1,
+      "user_id": 1,
+      "book_id": 1,
+      "borrow_date": "2024-06-01",
+      "due_date": "2024-06-15",
+      "return_date": "2024-06-12",
+      "status": "returned"
+    },
+    {
+      "id": 2,
+      "user_id": 2,
+      "book_id": 2,
+      "borrow_date": "2024-06-05",
+      "due_date": "2024-06-19",
+      "return_date": "",
+      "status": "borrowed"
+    },
+    {
+      "id": 3,
+      "user_id": 1,
+      "book_id": 6,
+      "borrow_date": "2024-06-10",
+      "due_date": "2024-06-24",
+      "return_date": "",
+      "status": "borrowed"
+    },
+    {
+      "id": 4,
+      "user_id": 3,
+      "book_id": 4,
+      "borrow_date": "2024-06-08",
+      "due_date": "2024-06-22",
+      "return_date": "2024-06-20",
+      "status": "returned"
+    },
+    {
+      "id": 5,
+      "user_id": 4,
+      "book_id": 5,
+      "borrow_date": "2024-06-12",
+      "due_date": "2024-06-26",
+      "return_date": "",
+      "status": "borrowed"
+    },
+    {
+      "id": 6,
+      "user_id": 2,
+      "book_id": 7,
+      "borrow_date": "2024-06-15",
+      "due_date": "2024-06-29",
+      "return_date": "",
+      "status": "borrowed"
+    },
+    {
+      "id": 7,
+      "user_id": 5,
+      "book_id": 8,
+      "borrow_date": "2024-06-18",
+      "due_date": "2024-07-02",
+      "return_date": "",
+      "status": "borrowed"
+    },
+    {
+      "id": 8,
+      "user_id": 3,
+      "book_id": 1,
+      "borrow_date": "2024-06-20",
+      "due_date": "2024-07-04",
+      "return_date": "",
+      "status": "borrowed"
+    }
+  ],
+  "statistics": {
+    "total_users": 5,
+    "total_books": 10,
+    "total_copies": 50,
+    "available_copies": 40,
+    "borrowed_copies": 10,
+    "total_borrows": 8,
+    "active_borrows": 6,
+    "returned_books": 2,
+    "overdue_books": 0
+  }
+}
