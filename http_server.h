@@ -81,11 +81,15 @@ private:
     std::string buildResponse(const HttpResponse& response);
     std::map<std::string, std::string> parseQueryString(const std::string& query);
     std::map<std::string, std::string> parsePostData(const std::string& data);
+    std::map<std::string, std::string> parseMultipartData(const std::string& body, const std::string& contentType);
     std::string urlDecode(const std::string& str);
     
     // 路由处理函数
     HttpResponse handleIndex(const HttpRequest& request);
+    HttpResponse handleLogin(const HttpRequest& request);
+    HttpResponse handleApiLogin(const HttpRequest& request);
     HttpResponse handleStatic(const HttpRequest& request);
+    HttpResponse handleStaticFile(const HttpRequest& request, const std::string& filePath);
     HttpResponse handleApiUsers(const HttpRequest& request);
     HttpResponse handleApiBooks(const HttpRequest& request);
     HttpResponse handleApiBorrow(const HttpRequest& request);
@@ -101,6 +105,7 @@ private:
     
     // HTML页面生成
     std::string generateIndexPage();
+    std::string generateLoginPage();
     std::string generateUsersPage();
     std::string generateBooksPage();
     std::string generateBorrowPage();

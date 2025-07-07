@@ -36,6 +36,8 @@ void HttpServer::cleanupWinsock() {
 void HttpServer::setupRoutes() {
     routes["/"] = [this](const HttpRequest& req) { return handleIndex(req); };
     routes["/index.html"] = [this](const HttpRequest& req) { return handleIndex(req); };
+    routes["/login"] = [this](const HttpRequest& req) { return handleLogin(req); };
+    routes["/api/login"] = [this](const HttpRequest& req) { return handleApiLogin(req); };
     routes["/users"] = [this](const HttpRequest& req) { return handleApiUsers(req); };
     routes["/books"] = [this](const HttpRequest& req) { return handleApiBooks(req); };
     routes["/borrow"] = [this](const HttpRequest& req) { return handleApiBorrow(req); };
@@ -104,27 +106,95 @@ void HttpServer::stop() {
 
 void HttpServer::handleClient(SOCKET clientSocket) {
     try {
+        std::string requestData;
         char buffer[4096];
-        int bytesReceived = recv(clientSocket, buffer, sizeof(buffer) - 1, 0);
+        int bytesReceived;
+
+        // 先读取一部分数据，期望能包含完整的请求头
+        bytesReceived = recv(clientSocket, buffer, sizeof(buffer) - 1, 0);
+        if (bytesReceived <= 0) {
+            closesocket(clientSocket);
+            return;
+        }
+        buffer[bytesReceived] = '\0';
+        requestData.append(buffer, bytesReceived);
+
+        // 检查是否收到了完整的请求头
+        size_t header_end_pos = requestData.find("\r\n\r\n");
+        if (header_end_pos == std::string::npos) {
+            // 如果4KB还不够一个请求头，那这个请求也太大了，直接放弃
+            errorResponse(413, "Request-Header Fields Too Large");
+            closesocket(clientSocket);
+            return;
+        }
+
+        // 解析请求头以获取Content-Length
+        std::string headers_part = requestData.substr(0, header_end_pos);
+        std::istringstream iss(headers_part);
+        std::string line;
+        int content_length = 0;
+        while (std::getline(iss, line) && line != "\r") {
+            size_t colon_pos = line.find(':');
+            if (colon_pos != std::string::npos) {
+                std::string key = line.substr(0, colon_pos);
+                if (key == "Content-Length") {
+                    std::string value = line.substr(colon_pos + 1);
+                    value.erase(0, value.find_first_not_of(" \t"));
+                    value.erase(value.find_last_not_of(" \t\r") + 1);
+                    try {
+                        content_length = std::stoi(value);
+                    } catch (...) {
+                        content_length = 0;
+                    }
+                    break;
+                }
+            }
+        }
+
+        // 如果有请求体，确保接收完整
+        if (content_length > 0) {
+            size_t body_start_pos = header_end_pos + 4;
+            size_t body_received = requestData.length() - body_start_pos;
+            if (body_received < content_length) {
+                requestData.resize(body_start_pos + content_length);
+                int remaining = content_length - body_received;
+                int current_pos = body_start_pos + body_received;
+                while (remaining > 0) {
+                    bytesReceived = recv(clientSocket, &requestData[current_pos], remaining, 0);
+                    if (bytesReceived <= 0) {
+                        // 连接断开或出错
+                        closesocket(clientSocket);
+                        return;
+                    }
+                    remaining -= bytesReceived;
+                    current_pos += bytesReceived;
+                }
+            }
+        }
+
+        HttpRequest request = parseRequest(requestData);
+        HttpResponse response;
         
-        if (bytesReceived > 0) {
-            buffer[bytesReceived] = '\0';
-            std::string requestData(buffer);
-            
-            HttpRequest request = parseRequest(requestData);
-            HttpResponse response;
-            
-            // 查找路由处理函数
-            auto it = routes.find(request.path);
-            if (it != routes.end()) {
-                response = it->second(request);
+        // 查找路由处理函数
+        auto it = routes.find(request.path);
+        if (it != routes.end()) {
+            response = it->second(request);
+        } else {
+            // 检查是否是带参数的API路由
+            if (request.path.find("/api/users/") == 0 && request.path.length() > 11) {
+                // 处理 /api/users/{id} 路由
+                response = handleApiUsers(request);
+            } else if (request.path.find("/api/books/") == 0 && request.path.length() > 11) {
+                // 处理 /api/books/{id} 路由
+                response = handleApiBooks(request);
             } else {
                 response = errorResponse(404, "Page Not Found");
             }
-            
-            std::string responseStr = buildResponse(response);
-            send(clientSocket, responseStr.c_str(), responseStr.length(), 0);
         }
+        
+        std::string responseStr = buildResponse(response);
+        send(clientSocket, responseStr.c_str(), responseStr.length(), 0);
+
     } catch (const std::exception& e) {
         std::cerr << "处理客户端请求时出错: " << e.what() << std::endl;
     }
@@ -134,7 +204,17 @@ void HttpServer::handleClient(SOCKET clientSocket) {
 
 HttpRequest HttpServer::parseRequest(const std::string& requestData) {
     HttpRequest request;
-    std::istringstream iss(requestData);
+    std::string headersPart;
+    
+    size_t bodyStartPos = requestData.find("\r\n\r\n");
+    if (bodyStartPos != std::string::npos) {
+        headersPart = requestData.substr(0, bodyStartPos);
+        request.body = requestData.substr(bodyStartPos + 4);
+    } else {
+        headersPart = requestData;
+    }
+
+    std::istringstream iss(headersPart);
     std::string line;
     
     // 解析请求行
@@ -166,19 +246,15 @@ HttpRequest HttpServer::parseRequest(const std::string& requestData) {
         }
     }
     
-    // 解析请求体
-    std::string body;
-    while (std::getline(iss, line)) {
-        body += line + "\n";
-    }
-    request.body = body;
-    
     // 解析POST数据
     if (request.method == "POST" && !request.body.empty()) {
         auto contentType = request.headers.find("Content-Type");
-        if (contentType != request.headers.end() && 
-            contentType->second.find("application/x-www-form-urlencoded") != std::string::npos) {
-            request.postParams = parseQueryString(request.body);
+        if (contentType != request.headers.end()) {
+            if (contentType->second.find("application/x-www-form-urlencoded") != std::string::npos) {
+                request.postParams = parseQueryString(request.body);
+            } else if (contentType->second.find("multipart/form-data") != std::string::npos) {
+                request.postParams = parseMultipartData(request.body, contentType->second);
+            }
         }
     }
     
@@ -221,6 +297,59 @@ std::map<std::string, std::string> HttpServer::parsePostData(const std::string& 
     return parseQueryString(data);
 }
 
+std::map<std::string, std::string> HttpServer::parseMultipartData(const std::string& body, const std::string& contentType) {
+    std::map<std::string, std::string> params;
+    
+    // 提取boundary
+    size_t boundaryPos = contentType.find("boundary=");
+    if (boundaryPos == std::string::npos) {
+        return params;
+    }
+    
+    std::string boundary = "--" + contentType.substr(boundaryPos + 9);
+    
+    // 分割multipart数据
+    size_t pos = 0;
+    while (pos < body.length()) {
+        size_t boundaryStart = body.find(boundary, pos);
+        if (boundaryStart == std::string::npos) break;
+        
+        size_t nextBoundaryStart = body.find(boundary, boundaryStart + boundary.length());
+        if (nextBoundaryStart == std::string::npos) break;
+        
+        // 提取这一部分的数据
+        std::string part = body.substr(boundaryStart + boundary.length(), 
+                                      nextBoundaryStart - boundaryStart - boundary.length());
+        
+        // 查找Content-Disposition头
+        size_t headerEnd = part.find("\r\n\r\n");
+        if (headerEnd != std::string::npos) {
+            std::string headers = part.substr(0, headerEnd);
+            std::string value = part.substr(headerEnd + 4);
+            
+            // 移除末尾的\r\n
+            if (value.length() >= 2 && value.substr(value.length() - 2) == "\r\n") {
+                value = value.substr(0, value.length() - 2);
+            }
+            
+            // 提取name属性
+            size_t namePos = headers.find("name=\"");
+            if (namePos != std::string::npos) {
+                namePos += 6; // 跳过name="
+                size_t nameEnd = headers.find("\"", namePos);
+                if (nameEnd != std::string::npos) {
+                    std::string name = headers.substr(namePos, nameEnd - namePos);
+                    params[name] = value;
+                }
+            }
+        }
+        
+        pos = nextBoundaryStart;
+    }
+    
+    return params;
+}
+
 std::string HttpServer::urlDecode(const std::string& str) {
     std::string result;
     for (size_t i = 0; i < str.length(); ++i) {
@@ -248,6 +377,96 @@ HttpResponse HttpServer::handleIndex(const HttpRequest& request) {
     return response;
 }
 
+HttpResponse HttpServer::handleLogin(const HttpRequest& request) {
+    HttpResponse response;
+    response.body = generateLoginPage();
+    return response;
+}
+
+HttpResponse HttpServer::handleApiLogin(const HttpRequest& request) {
+    if (request.method == "POST") {
+        std::string username, password;
+        
+        // 检查Content-Type来决定如何解析数据
+        auto contentType = request.headers.find("Content-Type");
+        if (contentType != request.headers.end() && 
+            contentType->second.find("application/json") != std::string::npos) {
+            // 解析JSON数据
+            Json::Value jsonData = parseJsonBody(request.body);
+            if (jsonData.isObject() && !jsonData["username"].isNull() && !jsonData["password"].isNull()) {
+                username = jsonData["username"].asString();
+                password = jsonData["password"].asString();
+            } else {
+                return errorResponse(400, "缺少用户名或密码");
+            }
+        } else {
+            // 解析form-urlencoded数据
+            auto usernameIt = request.postParams.find("username");
+            auto passwordIt = request.postParams.find("password");
+            
+            if (usernameIt != request.postParams.end() && passwordIt != request.postParams.end()) {
+                username = usernameIt->second;
+                password = passwordIt->second;
+            } else {
+                return errorResponse(400, "缺少用户名或密码");
+            }
+        }
+        
+        // 根据用户名判断用户类型并验证
+        bool loginSuccess = false;
+        std::string message = "";
+        std::string userType = "";
+        
+        // 管理员账户验证
+        if (username == "admin" && password == "1234") {
+            loginSuccess = true;
+            userType = "admin";
+            message = "管理员登录成功";
+        }
+        // 预设的读者账户验证
+        else if (username == "reader" && password == "reader123") {
+            loginSuccess = true;
+            userType = "reader";
+            message = "读者登录成功";
+        }
+        // 可以在这里添加更多预设账户或从数据库验证
+        else if (username == "librarian" && password == "lib123") {
+            loginSuccess = true;
+            userType = "admin";
+            message = "图书管理员登录成功";
+        }
+        else {
+            message = "用户名或密码错误";
+        }
+        
+        Json::Value result;
+        result["success"] = loginSuccess;
+        result["message"] = message;
+        if (loginSuccess) {
+            result["userType"] = userType;
+            result["username"] = username;
+        }
+        
+        return jsonResponse(result);
+    }
+    return errorResponse(405, "Method Not Allowed");
+}
+
+HttpResponse HttpServer::handleStaticFile(const HttpRequest& request, const std::string& filePath) {
+    HttpResponse response;
+    std::string content = readFile(filePath);
+    
+    if (content.empty()) {
+        return errorResponse(404, "File not found");
+    }
+    
+    response.body = content;
+    response.headers["Content-Type"] = getContentType(filePath);
+    response.headers["Cache-Control"] = "public, max-age=3600";
+    
+    return response;
+}
+
 HttpResponse HttpServer::handleApiUsers(const HttpRequest& request) {
     if (request.method == "GET") {
         // 获取用户列表
@@ -259,22 +478,108 @@ HttpResponse HttpServer::handleApiUsers(const HttpRequest& request) {
         return jsonResponse(usersJson);
     } else if (request.method == "POST") {
         // 添加用户
-        auto name = request.postParams.find("name");
-        auto email = request.postParams.find("email");
-        auto phone = request.postParams.find("phone");
+        std::string name, email, phone;
         
-        if (name != request.postParams.end() && email != request.postParams.end() && 
-            phone != request.postParams.end()) {
-            int userId = librarySystem->addUser(name->second, email->second, phone->second);
-            if (userId > 0) {
-                Json::Value result;
-                result["success"] = true;
-                result["userId"] = userId;
-                result["message"] = "用户添加成功";
-                return jsonResponse(result);
+        // 检查Content-Type来决定如何解析数据
+        auto contentType = request.headers.find("Content-Type");
+        if (contentType != request.headers.end() && 
+            contentType->second.find("application/json") != std::string::npos) {
+            // 解析JSON数据
+            Json::Value jsonData = parseJsonBody(request.body);
+            if (jsonData.isObject() && !jsonData["name"].isNull() && 
+                !jsonData["email"].isNull() && !jsonData["phone"].isNull()) {
+                name = jsonData["name"].asString();
+                email = jsonData["email"].asString();
+                phone = jsonData["phone"].asString();
+            } else {
+                return errorResponse(400, "缺少必要参数");
+            }
+        } else {
+            // 解析form-urlencoded数据
+            auto nameIt = request.postParams.find("name");
+            auto emailIt = request.postParams.find("email");
+            auto phoneIt = request.postParams.find("phone");
+            
+            if (nameIt != request.postParams.end() && emailIt != request.postParams.end() && 
+                phoneIt != request.postParams.end()) {
+                name = nameIt->second;
+                email = emailIt->second;
+                phone = phoneIt->second;
+            } else {
+                return errorResponse(400, "缺少必要参数");
             }
         }
+        
+        int userId = librarySystem->addUser(name, email, phone);
+        if (userId > 0) {
+            Json::Value result;
+            result["success"] = true;
+            result["userId"] = userId;
+            result["message"] = "用户添加成功";
+            return jsonResponse(result);
+        }
         return errorResponse(400, "添加用户失败");
+    } else if (request.method == "PUT") {
+        // 修改用户
+        // 从URL路径中提取用户ID
+        std::string path = request.path;
+        size_t pos = path.find("/api/users/");
+        if (pos == std::string::npos) {
+            return errorResponse(400, "无效的URL路径");
+        }
+        
+        std::string userIdStr = path.substr(pos + 11); // "/api/users/"的长度是11
+        int userId;
+        try {
+            userId = std::stoi(userIdStr);
+        } catch (const std::exception& e) {
+            return errorResponse(400, "无效的用户ID");
+        }
+        
+        std::string name, email, phone;
+        
+        // 解析JSON数据
+        Json::Value jsonData = parseJsonBody(request.body);
+        if (jsonData.isObject() && !jsonData["name"].isNull() && 
+            !jsonData["email"].isNull() && !jsonData["phone"].isNull()) {
+            name = jsonData["name"].asString();
+            email = jsonData["email"].asString();
+            phone = jsonData["phone"].asString();
+        } else {
+            return errorResponse(400, "缺少必要参数");
+        }
+        
+        if (librarySystem->updateUser(userId, name, email, phone)) {
+            Json::Value result;
+            result["success"] = true;
+            result["message"] = "用户修改成功";
+            return jsonResponse(result);
+        }
+        return errorResponse(400, "修改用户失败");
+    } else if (request.method == "DELETE") {
+        // 删除用户
+        // 从URL路径中提取用户ID
+        std::string path = request.path;
+        size_t pos = path.find("/api/users/");
+        if (pos == std::string::npos) {
+            return errorResponse(400, "无效的URL路径");
+        }
+        
+        std::string userIdStr = path.substr(pos + 11); // "/api/users/"的长度是11
+        int userId;
+        try {
+            userId = std::stoi(userIdStr);
+        } catch (const std::exception& e) {
+            return errorResponse(400, "无效的用户ID");
+        }
+        
+        if (librarySystem->deleteUser(userId)) {
+            Json::Value result;
+            result["success"] = true;
+            result["message"] = "用户删除成功";
+            return jsonResponse(result);
+        }
+        return errorResponse(400, "删除用户失败");
     }
     return errorResponse(405, "Method Not Allowed");
 }
@@ -298,87 +603,215 @@ HttpResponse HttpServer::handleApiBooks(const HttpRequest& request) {
         return jsonResponse(booksJson);
     } else if (request.method == "POST") {
         // 添加图书
-        auto title = request.postParams.find("title");
-        auto author = request.postParams.find("author");
-        auto category = request.postParams.find("category");
-        auto keywords = request.postParams.find("keywords");
-        auto description = request.postParams.find("description");
+        std::string title, author, category, keywords, description;
         
-        if (title != request.postParams.end() && author != request.postParams.end()) {
-            std::string cat = (category != request.postParams.end()) ? category->second : "";
-            std::string key = (keywords != request.postParams.end()) ? keywords->second : "";
-            std::string desc = (description != request.postParams.end()) ? description->second : "";
+        // 检查Content-Type来决定如何解析数据
+        auto contentType = request.headers.find("Content-Type");
+        if (contentType != request.headers.end() && 
+            contentType->second.find("application/json") != std::string::npos) {
+            // 解析JSON数据
+            Json::Value jsonData = parseJsonBody(request.body);
+            if (jsonData.isObject() && !jsonData["title"].isNull() && !jsonData["author"].isNull()) {
+                title = jsonData["title"].asString();
+                author = jsonData["author"].asString();
+                category = jsonData["category"].isNull() ? "" : jsonData["category"].asString();
+                keywords = jsonData["keywords"].isNull() ? "" : jsonData["keywords"].asString();
+                description = jsonData["description"].isNull() ? "" : jsonData["description"].asString();
+            } else {
+                return errorResponse(400, "缺少必要参数");
+            }
+        } else {
+            // 解析form-urlencoded数据
+            auto titleIt = request.postParams.find("title");
+            auto authorIt = request.postParams.find("author");
+            auto categoryIt = request.postParams.find("category");
+            auto keywordsIt = request.postParams.find("keywords");
+            auto descriptionIt = request.postParams.find("description");
             
-            int bookId = librarySystem->addBook(title->second, author->second, cat, key, desc);
-            if (bookId > 0) {
-                Json::Value result;
-                result["success"] = true;
-                result["bookId"] = bookId;
-                result["message"] = "图书添加成功";
-                return jsonResponse(result);
+            if (titleIt != request.postParams.end() && authorIt != request.postParams.end()) {
+                title = titleIt->second;
+                author = authorIt->second;
+                category = (categoryIt != request.postParams.end()) ? categoryIt->second : "";
+                keywords = (keywordsIt != request.postParams.end()) ? keywordsIt->second : "";
+                description = (descriptionIt != request.postParams.end()) ? descriptionIt->second : "";
+            } else {
+                return errorResponse(400, "缺少必要参数");
             }
         }
+        
+        int bookId = librarySystem->addBook(title, author, category, keywords, description);
+        if (bookId > 0) {
+            Json::Value result;
+            result["success"] = true;
+            result["bookId"] = bookId;
+            result["message"] = "图书添加成功";
+            return jsonResponse(result);
+        }
         return errorResponse(400, "添加图书失败");
+    } else if (request.method == "PUT") {
+        // 修改图书
+        // 从URL路径中提取图书ID
+        std::string path = request.path;
+        size_t pos = path.find("/api/books/");
+        if (pos == std::string::npos) {
+            return errorResponse(400, "无效的URL路径");
+        }
+        
+        std::string bookIdStr = path.substr(pos + 11); // "/api/books/"的长度是11
+        int bookId;
+        try {
+            bookId = std::stoi(bookIdStr);
+        } catch (const std::exception& e) {
+            return errorResponse(400, "无效的图书ID");
+        }
+        
+        std::string title, author, category, keywords, description;
+        
+        // 解析JSON数据
+        Json::Value jsonData = parseJsonBody(request.body);
+        if (jsonData.isObject() && !jsonData["title"].isNull() && !jsonData["author"].isNull()) {
+            title = jsonData["title"].asString();
+            author = jsonData["author"].asString();
+            category = jsonData["category"].isNull() ? "" : jsonData["category"].asString();
+            keywords = jsonData["keywords"].isNull() ? "" : jsonData["keywords"].asString();
+            description = jsonData["description"].isNull() ? "" : jsonData["description"].asString();
+        } else {
+            return errorResponse(400, "缺少必要参数");
+        }
+        
+        if (librarySystem->updateBook(bookId, title, author, category, keywords, description)) {
+            Json::Value result;
+            result["success"] = true;
+            result["message"] = "图书修改成功";
+            return jsonResponse(result);
+        }
+        return errorResponse(400, "修改图书失败");
+    } else if (request.method == "DELETE") {
+        // 删除图书
+        // 从URL路径中提取图书ID
+        std::string path = request.path;
+        size_t pos = path.find("/api/books/");
+        if (pos == std::string::npos) {
+            return errorResponse(400, "无效的URL路径");
+        }
+        
+        std::string bookIdStr = path.substr(pos + 11); // "/api/books/"的长度是11
+        int bookId;
+        try {
+            bookId = std::stoi(bookIdStr);
+        } catch (const std::exception& e) {
+            return errorResponse(400, "无效的图书ID");
+        }
+        
+        if (librarySystem->deleteBook(bookId)) {
+            Json::Value result;
+            result["success"] = true;
+            result["message"] = "图书删除成功";
+            return jsonResponse(result);
+        }
+        return errorResponse(400, "删除图书失败");
     }
     return errorResponse(405, "Method Not Allowed");
 }
 
 HttpResponse HttpServer::handleApiBorrow(const HttpRequest& request) {
     if (request.method == "POST") {
-        auto userIdStr = request.postParams.find("userId");
-        auto bookIdStr = request.postParams.find("bookId");
+        std::string userIdStr, bookIdStr;
         
-        if (userIdStr != request.postParams.end() && bookIdStr != request.postParams.end()) {
-            try {
-                int userId = std::stoi(userIdStr->second);
-                int bookId = std::stoi(bookIdStr->second);
-                
-                if (librarySystem->borrowBook(userId, bookId)) {
-                    Json::Value result;
-                    result["success"] = true;
-                    result["message"] = "借阅成功";
-                    return jsonResponse(result);
-                } else {
-                    Json::Value result;
-                    result["success"] = false;
-                    result["message"] = "借阅失败：用户不存在、图书不可借或已达借阅上限";
-                    return jsonResponse(result, 400);
-                }
-            } catch (const std::exception& e) {
-                return errorResponse(400, "无效的用户ID或图书ID");
+        // 检查Content-Type来决定如何解析数据
+        auto contentType = request.headers.find("Content-Type");
+        if (contentType != request.headers.end() && 
+            contentType->second.find("application/json") != std::string::npos) {
+            // 解析JSON数据
+            Json::Value jsonData = parseJsonBody(request.body);
+            if (jsonData.isObject() && !jsonData["userId"].isNull() && !jsonData["bookId"].isNull()) {
+                userIdStr = jsonData["userId"].asString();
+                bookIdStr = jsonData["bookId"].asString();
+            } else {
+                return errorResponse(400, "缺少必要参数");
+            }
+        } else {
+            // 解析form-urlencoded数据
+            auto userIdIt = request.postParams.find("userId");
+            auto bookIdIt = request.postParams.find("bookId");
+            
+            if (userIdIt != request.postParams.end() && bookIdIt != request.postParams.end()) {
+                userIdStr = userIdIt->second;
+                bookIdStr = bookIdIt->second;
+            } else {
+                return errorResponse(400, "缺少必要参数");
             }
         }
-        return errorResponse(400, "缺少必要参数");
+        
+        try {
+            int userId = std::stoi(userIdStr);
+            int bookId = std::stoi(bookIdStr);
+            
+            if (librarySystem->borrowBook(userId, bookId)) {
+                Json::Value result;
+                result["success"] = true;
+                result["message"] = "借阅成功";
+                return jsonResponse(result);
+            } else {
+                Json::Value result;
+                result["success"] = false;
+                result["message"] = "借阅失败：用户不存在、图书不可借或已达借阅上限";
+                return jsonResponse(result, 400);
+            }
+        } catch (const std::exception& e) {
+            return errorResponse(400, "无效的用户ID或图书ID");
+        }
     }
     return errorResponse(405, "Method Not Allowed");
 }
 
 HttpResponse HttpServer::handleApiReturn(const HttpRequest& request) {
     if (request.method == "POST") {
-        auto userIdStr = request.postParams.find("userId");
-        auto bookIdStr = request.postParams.find("bookId");
+        std::string userIdStr, bookIdStr;
         
-        if (userIdStr != request.postParams.end() && bookIdStr != request.postParams.end()) {
-            try {
-                int userId = std::stoi(userIdStr->second);
-                int bookId = std::stoi(bookIdStr->second);
-                
-                if (librarySystem->returnBook(userId, bookId)) {
-                    Json::Value result;
-                    result["success"] = true;
-                    result["message"] = "归还成功";
-                    return jsonResponse(result);
-                } else {
-                    Json::Value result;
-                    result["success"] = false;
-                    result["message"] = "归还失败：用户不存在、图书不存在或该用户未借阅此书";
-                    return jsonResponse(result, 400);
-                }
-            } catch (const std::exception& e) {
-                return errorResponse(400, "无效的用户ID或图书ID");
+        // 检查Content-Type来决定如何解析数据
+        auto contentType = request.headers.find("Content-Type");
+        if (contentType != request.headers.end() && 
+            contentType->second.find("application/json") != std::string::npos) {
+            // 解析JSON数据
+            Json::Value jsonData = parseJsonBody(request.body);
+            if (jsonData.isObject() && !jsonData["userId"].isNull() && !jsonData["bookId"].isNull()) {
+                userIdStr = jsonData["userId"].asString();
+                bookIdStr = jsonData["bookId"].asString();
+            } else {
+                return errorResponse(400, "缺少必要参数");
+            }
+        } else {
+            // 解析form-urlencoded数据
+            auto userIdIt = request.postParams.find("userId");
+            auto bookIdIt = request.postParams.find("bookId");
+            
+            if (userIdIt != request.postParams.end() && bookIdIt != request.postParams.end()) {
+                userIdStr = userIdIt->second;
+                bookIdStr = bookIdIt->second;
+            } else {
+                return errorResponse(400, "缺少必要参数");
             }
         }
-        return errorResponse(400, "缺少必要参数");
+        
+        try {
+            int userId = std::stoi(userIdStr);
+            int bookId = std::stoi(bookIdStr);
+            
+            if (librarySystem->returnBook(userId, bookId)) {
+                Json::Value result;
+                result["success"] = true;
+                result["message"] = "归还成功";
+                return jsonResponse(result);
+            } else {
+                Json::Value result;
+                result["success"] = false;
+                result["message"] = "归还失败：用户不存在、图书不存在或该用户未借阅此书";
+                return jsonResponse(result, 400);
+            }
+        } catch (const std::exception& e) {
+            return errorResponse(400, "无效的用户ID或图书ID");
+        }
     }
     return errorResponse(405, "Method Not Allowed");
 }
@@ -404,11 +837,27 @@ std::string HttpServer::getContentType(const std::string& filename) {
     if (filename.size() >= 4 && filename.substr(filename.size() - 4) == ".css") return "text/css";
     if (filename.size() >= 3 && filename.substr(filename.size() - 3) == ".js") return "application/javascript";
     if (filename.size() >= 5 && filename.substr(filename.size() - 5) == ".json") return "application/json";
+    if (filename.size() >= 4 && filename.substr(filename.size() - 4) == ".png") return "image/png";
+    if (filename.size() >= 4 && filename.substr(filename.size() - 4) == ".jpg") return "image/jpeg";
+    if (filename.size() >= 5 && filename.substr(filename.size() - 5) == ".jpeg") return "image/jpeg";
+    if (filename.size() >= 4 && filename.substr(filename.size() - 4) == ".svg") return "image/svg+xml";
     return "text/plain";
 }
 
 std::string HttpServer::readFile(const std::string& filename) {
-    std::ifstream file(filename);
+    // 检查文件扩展名，决定是否以二进制模式打开
+    bool isBinary = false;
+    if (filename.size() >= 4) {
+        std::string ext = filename.substr(filename.size() - 4);
+        if (ext == ".png" || ext == ".jpg" || ext == ".gif" || ext == ".ico") {
+            isBinary = true;
+        }
+    }
+    if (filename.size() >= 5 && filename.substr(filename.size() - 5) == ".jpeg") {
+        isBinary = true;
+    }
+    
+    std::ifstream file(filename, isBinary ? std::ios::binary : std::ios::in);
     if (!file.is_open()) {
         return "";
     }
@@ -443,6 +892,297 @@ HttpResponse HttpServer::errorResponse(int statusCode, const std::string& messag
     return jsonResponse(error, statusCode);
 }
 
+std::string HttpServer::generateLoginPage() {
+    return R"HTML(
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>图书管理系统 - 登录</title>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <style>
+        :root {
+            --bg-color: #ffffff;
+            --text-color: #37352f;
+            --border-color: #e9e9e7;
+            --hover-color: #f7f6f3;
+            --primary-color: #2383e2;
+        }
+        
+        [data-theme="dark"] {
+            --bg-color: #191919;
+            --text-color: #e9e9e7;
+            --border-color: #373737;
+            --hover-color: #2f2f2f;
+            --primary-color: #529cca;
+        }
+        
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, 'Apple Color Emoji', Arial, sans-serif;
+            background-color: var(--bg-color);
+            color: var(--text-color);
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            transition: all 0.3s ease;
+        }
+        
+        .login-container {
+            background: var(--bg-color);
+            border: 1px solid var(--border-color);
+            border-radius: 8px;
+            padding: 48px;
+            width: 100%;
+            max-width: 400px;
+            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06);
+        }
+        
+        .logo-container {
+            text-align: center;
+            margin-bottom: 32px;
+        }
+        
+        .title {
+            font-size: 24px;
+            font-weight: 600;
+            margin-bottom: 8px;
+            color: var(--text-color);
+        }
+        
+        .subtitle {
+            font-size: 14px;
+            color: var(--text-color);
+            opacity: 0.7;
+        }
+        
+        .form-group {
+            margin-bottom: 20px;
+            position: relative;
+        }
+        
+        .form-group label {
+            display: block;
+            margin-bottom: 6px;
+            font-size: 14px;
+            font-weight: 500;
+            color: var(--text-color);
+        }
+        
+        .input-wrapper {
+            position: relative;
+        }
+        
+        .input-icon {
+            position: absolute;
+            left: 12px;
+            top: 50%;
+            transform: translateY(-50%);
+            color: var(--text-color);
+            opacity: 0.5;
+        }
+        
+        .form-group input {
+            width: 100%;
+            padding: 12px 12px 12px 40px;
+            border: 1px solid var(--border-color);
+            border-radius: 6px;
+            font-size: 16px;
+            background-color: var(--bg-color);
+            color: var(--text-color);
+            transition: border-color 0.2s ease;
+        }
+        
+        .form-group input:focus {
+            outline: none;
+            border-color: var(--primary-color);
+            box-shadow: 0 0 0 3px rgba(35, 131, 226, 0.1);
+        }
+        
+        .btn {
+            width: 100%;
+            padding: 12px;
+            background-color: var(--primary-color);
+            color: white;
+            border: none;
+            border-radius: 6px;
+            font-size: 16px;
+            font-weight: 500;
+            cursor: pointer;
+            transition: all 0.2s ease;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 8px;
+        }
+        
+        .btn:hover {
+            background-color: #1a73d1;
+            transform: translateY(-1px);
+        }
+        
+        .theme-toggle {
+            position: absolute;
+            top: 20px;
+            right: 20px;
+            background: none;
+            border: 1px solid var(--border-color);
+            border-radius: 6px;
+            padding: 8px 12px;
+            cursor: pointer;
+            color: var(--text-color);
+            transition: all 0.2s ease;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+        
+        .theme-toggle:hover {
+            background-color: var(--hover-color);
+        }
+        
+        .error-message {
+            color: #dc2626;
+            font-size: 14px;
+            margin-top: 8px;
+            display: none;
+        }
+    </style>
+</head>
+<body>
+    <button class="theme-toggle" onclick="toggleTheme()">
+        <i id="theme-icon" class="fas fa-moon"></i>
+        <span id="theme-text">深色模式</span>
+    </button>
+    
+    <div class="login-container">
+        <div class="logo-container">
+            <h1 class="title">图书管理系统</h1>
+            <p class="subtitle">请输入您的账户信息登录</p>
+        </div>
+        
+        <form id="loginForm">
+            <div class="form-group">
+                <label for="username">
+                    <i class="fas fa-user"></i> 用户名
+                </label>
+                <div class="input-wrapper">
+                    <i class="fas fa-user input-icon"></i>
+                    <input type="text" id="username" name="username" required placeholder="请输入用户名">
+                </div>
+            </div>
+            
+            <div class="form-group">
+                <label for="password">
+                    <i class="fas fa-lock"></i> 密码
+                </label>
+                <div class="input-wrapper">
+                    <i class="fas fa-lock input-icon"></i>
+                    <input type="password" id="password" name="password" required placeholder="请输入密码">
+                </div>
+            </div>
+            
+            <div class="error-message" id="errorMessage"></div>
+            
+            <button type="submit" class="btn">
+                <i class="fas fa-sign-in-alt"></i>
+                登录
+            </button>
+        </form>
+    </div>
+    
+    <script>
+        function toggleTheme() {
+            const body = document.body;
+            const themeIcon = document.getElementById('theme-icon');
+            const themeText = document.getElementById('theme-text');
+            
+            if (body.getAttribute('data-theme') === 'dark') {
+                body.removeAttribute('data-theme');
+                themeIcon.className = 'fas fa-moon';
+                themeText.textContent = '深色模式';
+                localStorage.setItem('theme', 'light');
+            } else {
+                body.setAttribute('data-theme', 'dark');
+                themeIcon.className = 'fas fa-sun';
+                themeText.textContent = '浅色模式';
+                localStorage.setItem('theme', 'dark');
+            }
+        }
+        
+        // 初始化主题
+        function initTheme() {
+            const savedTheme = localStorage.getItem('theme');
+            const themeIcon = document.getElementById('theme-icon');
+            const themeText = document.getElementById('theme-text');
+            
+            if (savedTheme === 'dark') {
+                document.body.setAttribute('data-theme', 'dark');
+                themeIcon.className = 'fas fa-sun';
+                themeText.textContent = '浅色模式';
+            }
+        }
+        
+        // 显示错误信息
+        function showError(message) {
+            const errorElement = document.getElementById('errorMessage');
+            errorElement.textContent = message;
+            errorElement.style.display = 'block';
+        }
+        
+        // 隐藏错误信息
+        function hideError() {
+            const errorElement = document.getElementById('errorMessage');
+            errorElement.style.display = 'none';
+        }
+        
+        // 登录处理
+        document.getElementById('loginForm').addEventListener('submit', function(e) {
+            e.preventDefault();
+            hideError();
+            
+            const username = document.getElementById('username').value;
+            const password = document.getElementById('password').value;
+            
+            // 发送登录请求到后端
+            fetch('/api/login', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/x-www-form-urlencoded',
+                },
+                body: `username=${encodeURIComponent(username)}&password=${encodeURIComponent(password)}`
+            })
+            .then(response => response.json())
+            .then(data => {
+                if (data.success) {
+                    localStorage.setItem('userType', data.userType);
+                    localStorage.setItem('username', data.username);
+                    window.location.href = '/';
+                } else {
+                    showError(data.message || '登录失败，请检查用户名和密码');
+                }
+            })
+            .catch(error => {
+                console.error('登录错误:', error);
+                showError('网络错误，请稍后重试');
+            });
+        });
+        
+        // 页面加载时初始化主题
+        initTheme();
+    </script>
+</body>
+</html>
+)HTML";
+}
+
 std::string HttpServer::generateIndexPage() {
     return R"HTML(
 <!DOCTYPE html>
@@ -451,7 +1191,35 @@ std::string HttpServer::generateIndexPage() {
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>图书管理系统</title>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css">
     <style>
+        :root {
+            --bg-color: #ffffff;
+            --text-color: #37352f;
+            --border-color: #e9e9e7;
+            --hover-color: #f7f6f3;
+            --primary-color: #2383e2;
+            --secondary-color: #6b7280;
+            --success-color: #059669;
+            --warning-color: #d97706;
+            --error-color: #dc2626;
+            --sidebar-bg: #f8f9fa;
+            --sidebar-width: 250px;
+        }
+        
+        [data-theme="dark"] {
+            --bg-color: #191919;
+            --text-color: #e9e9e7;
+            --border-color: #373737;
+            --hover-color: #2f2f2f;
+            --primary-color: #529cca;
+            --secondary-color: #9ca3af;
+            --success-color: #10b981;
+            --warning-color: #f59e0b;
+            --error-color: #ef4444;
+            --sidebar-bg: #2d2d2d;
+        }
+        
         * {
             margin: 0;
             padding: 0;
@@ -459,142 +1227,617 @@ std::string HttpServer::generateIndexPage() {
         }
         
         body {
-            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, 'Apple Color Emoji', Arial, sans-serif;
+            background-color: var(--bg-color);
+            color: var(--text-color);
+            line-height: 1.5;
+            transition: all 0.3s ease;
+            display: flex;
             min-height: 100vh;
-            color: #333;
         }
         
-        .container {
-            max-width: 1200px;
-            margin: 0 auto;
-            padding: 20px;
+        .top-bar {
+            position: fixed;
+            top: 0;
+            right: 0;
+            left: var(--sidebar-width);
+            height: 60px;
+            background-color: var(--bg-color);
+            border-bottom: 1px solid var(--border-color);
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 0 20px;
+            gap: 12px;
+            z-index: 1000;
+            transition: left 0.3s ease;
         }
         
-        .header {
+        .top-search {
+            flex: 1;
+            max-width: 400px;
+            position: relative;
+        }
+        
+        .top-search input {
+            width: 100%;
+            padding: 8px 12px 8px 36px;
+            border: 1px solid var(--border-color);
+            border-radius: 20px;
+            font-size: 14px;
+            background-color: var(--hover-color);
+            color: var(--text-color);
+            transition: all 0.2s ease;
+        }
+        
+        .top-search input:focus {
+            outline: none;
+            border-color: var(--primary-color);
+            box-shadow: 0 0 0 3px rgba(35, 131, 226, 0.1);
+        }
+        
+        .top-search i {
+            position: absolute;
+            left: 12px;
+            top: 50%;
+            transform: translateY(-50%);
+            color: var(--secondary-color);
+        }
+        
+        .search-results {
+            position: absolute;
+            top: 100%;
+            left: 0;
+            right: 0;
+            background: var(--bg-color);
+            border: 1px solid var(--border-color);
+            border-top: none;
+            border-radius: 0 0 6px 6px;
+            max-height: 300px;
+            overflow-y: auto;
+            z-index: 1000;
+            display: none;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+        }
+        
+        .search-result-item {
+            padding: 10px 12px;
+            border-bottom: 1px solid var(--border-color);
+            cursor: pointer;
+            transition: background-color 0.2s;
+        }
+        
+        .search-result-item:hover {
+            background: var(--hover-color);
+        }
+        
+        .search-result-item:last-child {
+            border-bottom: none;
+        }
+        
+        .search-result-type {
+            font-size: 12px;
+            color: var(--secondary-color);
+            margin-bottom: 2px;
+            display: flex;
+            align-items: center;
+            gap: 4px;
+        }
+        
+        .search-result-title {
+            font-weight: 500;
+            margin-bottom: 2px;
+        }
+        
+        .search-result-subtitle {
+            font-size: 12px;
+            color: var(--secondary-color);
+        }
+        
+        .no-results {
+            padding: 15px 12px;
             text-align: center;
+            color: var(--secondary-color);
+            font-size: 14px;
+        }
+        
+        .data-table tbody tr.highlight {
+            background-color: rgba(35, 131, 226, 0.1);
+            border-left: 3px solid var(--primary-color);
+            animation: highlightFade 3s ease-out;
+        }
+        
+        @keyframes highlightFade {
+            0% {
+                background-color: rgba(35, 131, 226, 0.3);
+            }
+            100% {
+                background-color: rgba(35, 131, 226, 0.1);
+            }
+        }
+        
+        .modal-overlay {
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: rgba(0, 0, 0, 0.5);
+            display: none;
+            justify-content: center;
+            align-items: center;
+            z-index: 2000;
+        }
+        
+        .modal-card {
+            background: var(--bg-color);
+            border-radius: 8px;
+            padding: 24px;
+            max-width: 500px;
+            width: 90%;
+            max-height: 80vh;
+            overflow-y: auto;
+            box-shadow: 0 10px 25px rgba(0, 0, 0, 0.2);
+        }
+        
+        .modal-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 20px;
+            padding-bottom: 12px;
+            border-bottom: 1px solid var(--border-color);
+        }
+        
+        .modal-title {
+            font-size: 18px;
+            font-weight: 600;
+            color: var(--text-color);
+        }
+        
+        .modal-close {
+            background: none;
+            border: none;
+            font-size: 20px;
+            cursor: pointer;
+            color: var(--secondary-color);
+            padding: 4px;
+            border-radius: 4px;
+            transition: all 0.2s ease;
+        }
+        
+        .modal-close:hover {
+            background: var(--hover-color);
+            color: var(--text-color);
+        }
+        
+        .add-button {
+            background: var(--primary-color);
             color: white;
-            margin-bottom: 40px;
+            border: none;
+            border-radius: 6px;
+            padding: 8px 12px;
+            cursor: pointer;
+            font-size: 14px;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            margin-bottom: 16px;
+            transition: all 0.2s ease;
         }
         
-        .header h1 {
-            font-size: 3rem;
-            margin-bottom: 10px;
-            text-shadow: 2px 2px 4px rgba(0,0,0,0.3);
+        .add-button:hover {
+            background: #1d72c7;
         }
         
-        .header p {
-            font-size: 1.2rem;
-            opacity: 0.9;
+        .action-buttons {
+            display: flex;
+            gap: 4px;
+            padding-right: 8px;
         }
         
-        .main-content {
-            display: grid;
-            grid-template-columns: 1fr 1fr;
-            gap: 30px;
-            margin-bottom: 40px;
+        .action-btn {
+            background: none;
+            border: none;
+            padding: 6px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 14px;
+            transition: all 0.2s ease;
+            color: var(--secondary-color);
+        }
+        
+        .action-btn:hover {
+            background: var(--hover-color);
+            color: var(--text-color);
+        }
+        
+        .action-btn.edit {
+            color: var(--primary-color);
+        }
+        
+        .action-btn.delete {
+            color: var(--error-color);
+        }
+        
+        .action-btn.edit:hover {
+            background: rgba(35, 131, 226, 0.1);
+        }
+        
+        .action-btn.delete:hover {
+            background: rgba(220, 38, 38, 0.1);
+        }
+        
+        .top-bar-right {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+        
+        .top-bar.sidebar-collapsed {
+            left: 60px;
+        }
+        
+        .user-dropdown {
+            position: relative;
+        }
+        
+        .user-button {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            background: none;
+            border: 1px solid var(--border-color);
+            border-radius: 6px;
+            padding: 8px 12px;
+            cursor: pointer;
+            color: var(--text-color);
+            transition: all 0.2s ease;
+            font-size: 14px;
+        }
+        
+        .user-button:hover {
+            background-color: var(--hover-color);
+        }
+        
+        .dropdown-menu {
+            position: absolute;
+            top: 100%;
+            right: 0;
+            background-color: var(--bg-color);
+            border: 1px solid var(--border-color);
+            border-radius: 6px;
+            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
+            min-width: 150px;
+            display: none;
+            z-index: 1001;
+        }
+        
+        .dropdown-menu.show {
+            display: block;
+        }
+        
+        .dropdown-item {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 12px 16px;
+            color: var(--text-color);
+            text-decoration: none;
+            transition: all 0.2s ease;
+            cursor: pointer;
+            border: none;
+            background: none;
+            width: 100%;
+            text-align: left;
+            font-size: 14px;
+        }
+        
+        .dropdown-item:hover {
+            background-color: var(--hover-color);
+        }
+        
+        .sidebar {
+            width: var(--sidebar-width);
+            background-color: var(--sidebar-bg);
+            border-right: 1px solid var(--border-color);
+            padding: 20px 0;
+            position: fixed;
+            height: 100vh;
+            overflow-y: auto;
+            transition: width 0.3s ease, transform 0.3s ease;
+        }
+        
+        .sidebar.collapsed {
+            width: 60px;
+        }
+        
+        .sidebar-toggle {
+            position: absolute;
+            top: 15px;
+            right: 15px;
+            width: 30px;
+            height: 30px;
+            background-color: var(--bg-color);
+            border: 1px solid var(--border-color);
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            cursor: pointer;
+            z-index: 1001;
+            transition: all 0.2s ease;
+        }
+        
+        .sidebar-toggle:hover {
+            background-color: var(--hover-color);
+        }
+        
+        .sidebar-header {
+            padding: 0 20px 20px;
+            border-bottom: 1px solid var(--border-color);
+            margin-bottom: 20px;
+            transition: all 0.3s ease;
+        }
+        
+        .sidebar.collapsed .sidebar-header {
+            padding: 0 10px 20px;
+            text-align: center;
+        }
+        
+        .sidebar-header h1 {
+            font-size: 18px;
+            font-weight: 600;
+            color: var(--text-color);
+            margin-bottom: 8px;
+            transition: all 0.3s ease;
+        }
+        
+        .sidebar.collapsed .sidebar-header h1 {
+            font-size: 0;
+        }
+        
+        .sidebar.collapsed .sidebar-header h1 i {
+            font-size: 20px;
+        }
+        
+        .nav-menu {
+            list-style: none;
+        }
+        
+        .nav-item {
+            margin-bottom: 4px;
+        }
+        
+        .nav-link {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            padding: 12px 20px;
+            color: var(--text-color);
+            text-decoration: none;
+            transition: all 0.2s ease;
+            cursor: pointer;
+            border: none;
+            background: none;
+            width: 100%;
+            text-align: left;
+            font-size: 14px;
+            position: relative;
+            min-height: 44px;
+        }
+        
+        .sidebar.collapsed .nav-link {
+            padding: 12px;
+            justify-content: center;
+            min-height: 44px;
+        }
+        
+        .nav-link:hover {
+            background-color: var(--hover-color);
+        }
+        
+        .nav-link.active {
+            background-color: var(--primary-color);
+            color: white;
+        }
+        
+        .nav-link i {
+            width: 16px;
+            text-align: center;
+            flex-shrink: 0;
+        }
+        
+        .nav-link span {
+            transition: all 0.3s ease;
+        }
+        
+        .sidebar.collapsed .nav-link span {
+            opacity: 0;
+            width: 0;
+            overflow: hidden;
+        }
+        
+        .sidebar.collapsed .nav-link {
+            position: relative;
+        }
+        
+        .sidebar.collapsed .nav-link:hover::after {
+            content: attr(data-tooltip);
+            position: absolute;
+            left: 100%;
+            top: 50%;
+            transform: translateY(-50%);
+            background-color: var(--text-color);
+            color: var(--bg-color);
+            padding: 4px 8px;
+            border-radius: 4px;
+            font-size: 12px;
+            white-space: nowrap;
+            margin-left: 8px;
+            z-index: 1002;
+        }
+        
+        .main-container {
+            flex: 1;
+            margin-left: var(--sidebar-width);
+            margin-top: 60px;
+            padding: 20px;
+            transition: margin-left 0.3s ease;
+        }
+        
+        .main-container.sidebar-collapsed {
+            margin-left: 60px;
+        }
+        
+        .content-area {
+            max-width: 1000px;
+            margin: 0 auto;
+        }
+        
+        .content-section {
+            display: none;
+        }
+        
+        .content-section.active {
+            display: block;
         }
         
         .section {
-            background: white;
-            border-radius: 15px;
-            padding: 30px;
-            box-shadow: 0 10px 30px rgba(0,0,0,0.1);
-            transition: transform 0.3s ease;
+            background: var(--bg-color);
+            border: 1px solid var(--border-color);
+            border-radius: 8px;
+            padding: 24px;
+            transition: all 0.2s ease;
         }
         
         .section:hover {
-            transform: translateY(-5px);
+            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06);
         }
         
         .section h2 {
-            color: #667eea;
-            margin-bottom: 20px;
-            font-size: 1.8rem;
-            border-bottom: 3px solid #667eea;
-            padding-bottom: 10px;
+            color: var(--text-color);
+            margin-bottom: 16px;
+            font-size: 18px;
+            font-weight: 600;
+            border-bottom: 1px solid var(--border-color);
+            padding-bottom: 8px;
         }
         
         .form-group {
-            margin-bottom: 20px;
+            margin-bottom: 16px;
         }
         
         .form-group label {
             display: block;
-            margin-bottom: 8px;
-            font-weight: 600;
-            color: #555;
+            margin-bottom: 6px;
+            font-size: 14px;
+            font-weight: 500;
+            color: var(--text-color);
         }
         
         .form-group input, .form-group textarea, .form-group select {
             width: 100%;
             padding: 12px;
-            border: 2px solid #e1e5e9;
-            border-radius: 8px;
-            font-size: 16px;
-            transition: border-color 0.3s ease;
+            border: 1px solid var(--border-color);
+            border-radius: 6px;
+            font-size: 14px;
+            background-color: var(--bg-color);
+            color: var(--text-color);
+            transition: border-color 0.2s ease;
         }
         
         .form-group input:focus, .form-group textarea:focus, .form-group select:focus {
             outline: none;
-            border-color: #667eea;
+            border-color: var(--primary-color);
+            box-shadow: 0 0 0 3px rgba(35, 131, 226, 0.1);
         }
         
         .btn {
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            color: white;
-            border: none;
-            padding: 12px 30px;
-            border-radius: 8px;
-            font-size: 16px;
-            font-weight: 600;
+            background-color: var(--text-color);
+            color: var(--bg-color);
+            border: 1px solid var(--text-color);
+            padding: 12px 16px;
+            border-radius: 6px;
+            font-size: 14px;
+            font-weight: 500;
             cursor: pointer;
-            transition: all 0.3s ease;
+            transition: all 0.2s ease;
             width: 100%;
         }
         
         .btn:hover {
-            transform: translateY(-2px);
-            box-shadow: 0 5px 15px rgba(102, 126, 234, 0.4);
+            background-color: var(--bg-color);
+            color: var(--text-color);
+            transform: translateY(-1px);
         }
         
-        .btn-secondary {
-            background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%);
+        .btn-primary {
+            background-color: var(--primary-color);
+            color: white;
+            border: 1px solid var(--primary-color);
+        }
+        
+        .btn-primary:hover {
+            background-color: transparent;
+            color: var(--primary-color);
         }
         
         .btn-success {
-            background: linear-gradient(135deg, #4facfe 0%, #00f2fe 100%);
+            background-color: var(--success-color);
+            color: white;
+            border: 1px solid var(--success-color);
+        }
+        
+        .btn-success:hover {
+            background-color: transparent;
+            color: var(--success-color);
+        }
+        
+        .btn-danger {
+            background-color: var(--error-color);
+            color: white;
+            border: 1px solid var(--error-color);
+        }
+        
+        .btn-danger:hover {
+            background-color: transparent;
+            color: var(--error-color);
         }
         
         .data-section {
             grid-column: 1 / -1;
-            background: white;
-            border-radius: 15px;
-            padding: 30px;
-            box-shadow: 0 10px 30px rgba(0,0,0,0.1);
+            background: var(--bg-color);
+            border: 1px solid var(--border-color);
+            border-radius: 8px;
+            padding: 24px;
         }
         
         .tabs {
             display: flex;
-            margin-bottom: 30px;
-            border-bottom: 2px solid #e1e5e9;
+            margin-bottom: 24px;
+            border-bottom: 1px solid var(--border-color);
         }
         
         .tab {
-            padding: 15px 30px;
+            padding: 12px 16px;
             background: none;
             border: none;
-            font-size: 16px;
-            font-weight: 600;
+            font-size: 14px;
+            font-weight: 500;
             cursor: pointer;
-            color: #666;
-            transition: all 0.3s ease;
-            border-bottom: 3px solid transparent;
+            color: var(--secondary-color);
+            transition: all 0.2s ease;
+            border-bottom: 2px solid transparent;
         }
         
         .tab.active {
-            color: #667eea;
-            border-bottom-color: #667eea;
+            color: var(--primary-color);
+            border-bottom-color: var(--primary-color);
+        }
+        
+        .tab:hover {
+            color: var(--text-color);
         }
         
         .tab-content {
@@ -608,260 +1851,349 @@ std::string HttpServer::generateIndexPage() {
         .data-table {
             width: 100%;
             border-collapse: collapse;
-            margin-top: 20px;
+            margin-top: 16px;
         }
         
         .data-table th, .data-table td {
             padding: 12px;
             text-align: left;
-            border-bottom: 1px solid #e1e5e9;
+            border-bottom: 1px solid var(--border-color);
         }
         
         .data-table th {
-            background: #f8f9fa;
-            font-weight: 600;
-            color: #555;
+            background-color: var(--hover-color);
+            font-weight: 500;
+            color: var(--text-color);
+            font-size: 14px;
         }
         
         .data-table tr:hover {
-            background: #f8f9fa;
+            background-color: var(--hover-color);
         }
         
         .status-available {
-            color: #28a745;
-            font-weight: 600;
+            color: var(--success-color);
+            font-weight: 500;
         }
         
         .status-borrowed {
-            color: #dc3545;
-            font-weight: 600;
+            color: var(--error-color);
+            font-weight: 500;
         }
         
         .search-box {
-            margin-bottom: 20px;
+            margin-bottom: 16px;
         }
         
         .search-box input {
             width: 100%;
             padding: 12px;
-            border: 2px solid #e1e5e9;
-            border-radius: 8px;
-            font-size: 16px;
+            border: 1px solid var(--border-color);
+            border-radius: 6px;
+            font-size: 14px;
+            background-color: var(--bg-color);
+            color: var(--text-color);
         }
         
         .message {
-            padding: 15px;
-            border-radius: 8px;
-            margin-bottom: 20px;
+            padding: 12px;
+            border-radius: 6px;
+            margin-bottom: 16px;
             display: none;
+            font-size: 14px;
         }
         
         .message.success {
-            background: #d4edda;
-            color: #155724;
-            border: 1px solid #c3e6cb;
+            background-color: #dcfce7;
+            color: var(--success-color);
+            border: 1px solid #bbf7d0;
         }
         
         .message.error {
-            background: #f8d7da;
-            color: #721c24;
-            border: 1px solid #f5c6cb;
+            background-color: #fef2f2;
+            color: var(--error-color);
+            border: 1px solid #fecaca;
         }
         
         .stats-grid {
             display: grid;
             grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-            gap: 20px;
-            margin-bottom: 30px;
+            gap: 16px;
+            margin-bottom: 24px;
         }
         
         .stat-card {
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            color: white;
+            background: var(--bg-color);
+            border: 1px solid var(--border-color);
+            color: var(--text-color);
             padding: 20px;
-            border-radius: 10px;
+            border-radius: 8px;
             text-align: center;
+            transition: all 0.2s ease;
+        }
+        
+        .stat-card:hover {
+            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06);
         }
         
         .stat-card h3 {
             font-size: 2rem;
-            margin-bottom: 5px;
+            margin-bottom: 8px;
+            color: var(--primary-color);
+            font-weight: 600;
         }
         
         .stat-card p {
-            opacity: 0.9;
+            color: var(--secondary-color);
+            font-size: 14px;
         }
         
         @media (max-width: 768px) {
-            .main-content {
-                grid-template-columns: 1fr;
+            .sidebar {
+                width: 100%;
+                height: auto;
+                position: relative;
+                border-right: none;
+                border-bottom: 1px solid var(--border-color);
             }
             
-            .header h1 {
-                font-size: 2rem;
+            .main-container {
+                margin-left: 0;
+                padding: 10px;
             }
             
-            .tabs {
-                flex-wrap: wrap;
+            .nav-menu {
+                display: flex;
+                overflow-x: auto;
+                padding: 0 10px;
             }
             
-            .tab {
-                flex: 1;
-                min-width: 120px;
+            .nav-item {
+                margin-bottom: 0;
+                margin-right: 4px;
+                flex-shrink: 0;
+            }
+            
+            .nav-link {
+                padding: 8px 12px;
+                font-size: 12px;
+                white-space: nowrap;
+            }
+            
+            .sidebar-header h1 {
+                font-size: 16px;
+            }
+            
+            .theme-toggle {
+                font-size: 10px;
+                padding: 4px 8px;
             }
         }
     </style>
 </head>
-<body>
-    <div class="container">
-        <div class="header">
-            <h1>📚 图书管理系统</h1>
-            <p>现代化的图书馆管理解决方案</p>
+<body data-theme="light">
+    <!-- 顶部栏 -->
+    <div class="top-bar">
+        <div class="top-search">
+            <i class="fas fa-search"></i>
+            <input type="text" id="globalSearch" placeholder="搜索用户或图书..." onkeyup="performGlobalSearch()" onfocus="showSearchResults()" onblur="hideSearchResults()">
+            <div class="search-results" id="searchResults"></div>
         </div>
-        
-        <div class="main-content">
-            <div class="section">
-                <h2>👤 用户管理</h2>
-                <div id="userMessage" class="message"></div>
-                <form id="userForm">
-                    <div class="form-group">
-                        <label for="userName">姓名</label>
-                        <input type="text" id="userName" name="name" required>
-                    </div>
-                    <div class="form-group">
-                        <label for="userEmail">邮箱</label>
-                        <input type="email" id="userEmail" name="email" required>
-                    </div>
-                    <div class="form-group">
-                        <label for="userPhone">电话</label>
-                        <input type="tel" id="userPhone" name="phone" required>
-                    </div>
-                    <button type="submit" class="btn">添加用户</button>
-                </form>
-            </div>
-            
-            <div class="section">
-                <h2>📖 图书管理</h2>
-                <div id="bookMessage" class="message"></div>
-                <form id="bookForm">
-                    <div class="form-group">
-                        <label for="bookTitle">书名</label>
-                        <input type="text" id="bookTitle" name="title" required>
-                    </div>
-                    <div class="form-group">
-                        <label for="bookAuthor">作者</label>
-                        <input type="text" id="bookAuthor" name="author" required>
-                    </div>
-                    <div class="form-group">
-                        <label for="bookCategory">类别</label>
-                        <input type="text" id="bookCategory" name="category">
-                    </div>
-                    <div class="form-group">
-                        <label for="bookKeywords">关键字</label>
-                        <input type="text" id="bookKeywords" name="keywords">
-                    </div>
-                    <div class="form-group">
-                        <label for="bookDescription">简介</label>
-                        <textarea id="bookDescription" name="description" rows="3"></textarea>
-                    </div>
-                    <button type="submit" class="btn">添加图书</button>
-                </form>
+        <div class="top-bar-right">
+            <div class="user-dropdown">
+                <button class="user-button" onclick="toggleUserDropdown()">
+                    <i class="fas fa-user-circle"></i>
+                    <span id="currentUser">管理员</span>
+                </button>
+                <div class="dropdown-menu" id="userDropdown">
+                    <button class="dropdown-item" onclick="toggleTheme()">
+                        <i class="fas fa-moon" id="themeIcon"></i>
+                        <span id="themeText">夜间模式</span>
+                    </button>
+                    <button class="dropdown-item" onclick="logout()">
+                        <i class="fas fa-sign-out-alt"></i>
+                        退出登录
+                    </button>
+                </div>
             </div>
         </div>
-        
-        <div class="main-content">
-            <div class="section">
-                <h2>📚 借阅管理</h2>
-                <div id="borrowMessage" class="message"></div>
-                <form id="borrowForm">
-                    <div class="form-group">
-                        <label for="borrowUserId">用户ID</label>
-                        <input type="number" id="borrowUserId" name="userId" required>
-                    </div>
-                    <div class="form-group">
-                        <label for="borrowBookId">图书ID</label>
-                        <input type="number" id="borrowBookId" name="bookId" required>
-                    </div>
-                    <button type="submit" class="btn btn-secondary">借阅图书</button>
-                </form>
-            </div>
-            
-            <div class="section">
-                <h2>📤 归还管理</h2>
-                <div id="returnMessage" class="message"></div>
-                <form id="returnForm">
-                    <div class="form-group">
-                        <label for="returnUserId">用户ID</label>
-                        <input type="number" id="returnUserId" name="userId" required>
-                    </div>
-                    <div class="form-group">
-                        <label for="returnBookId">图书ID</label>
-                        <input type="number" id="returnBookId" name="bookId" required>
-                    </div>
-                    <button type="submit" class="btn btn-success">归还图书</button>
-                </form>
-            </div>
+    </div>
+    
+    <!-- 左侧导航栏 -->
+    <div class="sidebar" id="sidebar">
+        <button class="sidebar-toggle" onclick="toggleSidebar()">
+            <i class="fas fa-bars"></i>
+        </button>
+        <div class="sidebar-header">
+            <h1><i class="fas fa-book"></i> <span>图书管理系统</span></h1>
         </div>
         
-        <div class="data-section">
-            <div class="tabs">
-                <button class="tab active" onclick="showTab('users')">用户列表</button>
-                <button class="tab" onclick="showTab('books')">图书列表</button>
-                <button class="tab" onclick="showTab('statistics')">统计分析</button>
+        <nav class="nav-menu">
+            <div class="nav-item">
+                <button class="nav-link active" onclick="showSection('users')" data-tooltip="用户管理">
+                    <i class="fas fa-users"></i>
+                    <span>用户管理</span>
+                </button>
+            </div>
+            <div class="nav-item">
+                <button class="nav-link" onclick="showSection('books')" data-tooltip="图书管理">
+                    <i class="fas fa-book"></i>
+                    <span>图书管理</span>
+                </button>
+            </div>
+            <div class="nav-item">
+                <button class="nav-link" onclick="showSection('borrow')" data-tooltip="借阅管理">
+                    <i class="fas fa-hand-holding"></i>
+                    <span>借阅管理</span>
+                </button>
+            </div>
+            <div class="nav-item">
+                <button class="nav-link" onclick="showSection('return')" data-tooltip="归还管理">
+                    <i class="fas fa-undo"></i>
+                    <span>归还管理</span>
+                </button>
+            </div>
+            <div class="nav-item">
+                <button class="nav-link" onclick="showSection('statistics')" data-tooltip="统计分析">
+                    <i class="fas fa-chart-bar"></i>
+                    <span>统计分析</span>
+                </button>
+            </div>
+        </nav>
+    </div>
+    
+    <!-- 主内容区域 -->
+    <div class="main-container">
+        <div class="content-area">
+            <!-- 用户管理 -->
+            <div id="users-section" class="content-section active">
+                <div class="section">
+                    <h2><i class="fas fa-users"></i> 用户管理</h2>
+                    <div id="userMessage" class="message"></div>
+                    <button class="add-button" onclick="openUserModal()">
+                        <i class="fas fa-plus"></i>
+                        添加用户
+                    </button>
+                    <table class="data-table" id="usersTable">
+                        <thead>
+                            <tr>
+                                <th width="80">操作</th>
+                                <th>ID</th>
+                                <th>姓名</th>
+                                <th>邮箱</th>
+                                <th>电话</th>
+                                <th>当前借阅</th>
+                            </tr>
+                        </thead>
+                        <tbody></tbody>
+                    </table>
+            </div>
             </div>
             
-            <div id="users" class="tab-content active">
-                <div class="search-box">
-                    <input type="text" id="userSearch" placeholder="搜索用户..." onkeyup="searchUsers()">
+            <!-- 图书管理 -->
+            <div id="books-section" class="content-section">
+                <div class="section">
+                    <h2><i class="fas fa-book"></i> 图书管理</h2>
+                    <div id="bookMessage" class="message"></div>
+                    <button class="add-button" onclick="openBookModal()">
+                        <i class="fas fa-plus"></i>
+                        添加图书
+                    </button>
+                    <table class="data-table" id="booksTable">
+                        <thead>
+                            <tr>
+                                <th width="80">操作</th>
+                                <th>ID</th>
+                                <th>书名</th>
+                                <th>作者</th>
+                                <th>类别</th>
+                                <th>状态</th>
+                            </tr>
+                        </thead>
+                        <tbody></tbody>
+                    </table>
                 </div>
-                <table class="data-table" id="usersTable">
-                    <thead>
-                        <tr>
-                            <th>ID</th>
-                            <th>姓名</th>
-                            <th>邮箱</th>
-                            <th>电话</th>
-                            <th>当前借阅</th>
-                        </tr>
-                    </thead>
-                    <tbody></tbody>
-                </table>
             </div>
             
-            <div id="books" class="tab-content">
-                <div class="search-box">
-                    <input type="text" id="bookSearch" placeholder="搜索图书..." onkeyup="searchBooks()">
+            <!-- 借阅管理 -->
+            <div id="borrow-section" class="content-section">
+                <div class="section">
+                    <h2><i class="fas fa-hand-holding"></i> 借阅管理</h2>
+                    <div id="borrowMessage" class="message"></div>
+                    <form id="borrowForm">
+                        <div class="form-group">
+                            <label for="borrowUserId">用户ID</label>
+                            <input type="number" id="borrowUserId" name="userId" required>
+                        </div>
+                        <div class="form-group">
+                            <label for="borrowBookId">图书ID</label>
+                            <input type="number" id="borrowBookId" name="bookId" required>
+                        </div>
+                        <button type="submit" class="btn btn-primary">借阅图书</button>
+                    </form>
                 </div>
-                <table class="data-table" id="booksTable">
-                    <thead>
-                        <tr>
-                            <th>ID</th>
-                            <th>书名</th>
-                            <th>作者</th>
-                            <th>类别</th>
-                            <th>状态</th>
-                        </tr>
-                    </thead>
-                    <tbody></tbody>
-                </table>
             </div>
             
-            <div id="statistics" class="tab-content">
-                <div class="stats-grid">
-                    <div class="stat-card">
-                        <h3 id="totalUsers">0</h3>
-                        <p>总用户数</p>
-                    </div>
-                    <div class="stat-card">
-                        <h3 id="totalBooks">0</h3>
-                        <p>总图书数</p>
-                    </div>
-                    <div class="stat-card">
-                        <h3 id="totalRecords">0</h3>
-                        <p>借阅记录</p>
-                    </div>
+            <!-- 归还管理 -->
+            <div id="return-section" class="content-section">
+                <div class="section">
+                    <h2><i class="fas fa-undo"></i> 归还管理</h2>
+                    <div id="returnMessage" class="message"></div>
+                    <form id="returnForm">
+                        <div class="form-group">
+                            <label for="returnUserId">用户ID</label>
+                            <input type="number" id="returnUserId" name="userId" required>
+                        </div>
+                        <div class="form-group">
+                            <label for="returnBookId">图书ID</label>
+                            <input type="number" id="returnBookId" name="bookId" required>
+                        </div>
+                        <button type="submit" class="btn btn-success">归还图书</button>
+                    </form>
                 </div>
-                <div id="statisticsContent"></div>
+            </div>
+            
+            <!-- 统计分析 -->
+            <div id="statistics-section" class="content-section">
+                <div class="section">
+                    <h2><i class="fas fa-chart-bar"></i> 统计分析</h2>
+                    <div class="stats-grid">
+                        <div class="stat-card">
+                            <h3 id="totalUsers">0</h3>
+                            <p>总用户数</p>
+                        </div>
+                        <div class="stat-card">
+                            <h3 id="totalBooks">0</h3>
+                            <p>总图书数</p>
+                        </div>
+                        <div class="stat-card">
+                            <h3 id="totalRecords">0</h3>
+                            <p>借阅记录</p>
+                        </div>
+                    </div>
+                    <div id="statisticsContent"></div>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <!-- 弹出卡片 -->
+    <div class="modal-overlay" id="modalOverlay">
+        <div class="modal-card">
+            <div class="modal-header">
+                <h3 class="modal-title" id="modalTitle">添加用户</h3>
+                <button class="modal-close" onclick="closeModal()">
+                    <i class="fas fa-times"></i>
+                </button>
+            </div>
+            <div class="modal-body">
+                <form id="modalForm">
+                    <div id="modalFormContent"></div>
+                    <div class="form-group" style="margin-top: 20px; text-align: right;">
+                        <button type="button" class="btn" onclick="closeModal()" style="margin-right: 10px; background: #6c757d;">取消</button>
+                        <button type="submit" class="btn" id="modalSubmitBtn">确定</button>
+                    </div>
+                </form>
             </div>
         </div>
     </div>
@@ -871,18 +2203,7 @@ std::string HttpServer::generateIndexPage() {
         let allUsers = [];
         let allBooks = [];
         
-        // 页面加载完成后初始化
-        document.addEventListener('DOMContentLoaded', function() {
-            loadUsers();
-            loadBooks();
-            loadStatistics();
-            
-            // 绑定表单提交事件
-            document.getElementById('userForm').addEventListener('submit', handleUserSubmit);
-            document.getElementById('bookForm').addEventListener('submit', handleBookSubmit);
-            document.getElementById('borrowForm').addEventListener('submit', handleBorrowSubmit);
-            document.getElementById('returnForm').addEventListener('submit', handleReturnSubmit);
-        });
+
         
         // 显示消息
         function showMessage(elementId, message, type) {
@@ -895,22 +2216,30 @@ std::string HttpServer::generateIndexPage() {
             }, 3000);
         }
         
-        // 切换标签页
-        function showTab(tabName) {
-            // 隐藏所有标签内容
-            const tabContents = document.querySelectorAll('.tab-content');
-            tabContents.forEach(content => content.classList.remove('active'));
+        // 切换导航栏
+        function showSection(sectionName) {
+            // 隐藏所有内容区域
+            const sections = document.querySelectorAll('.content-section');
+            sections.forEach(section => section.classList.remove('active'));
             
-            // 移除所有标签的活动状态
-            const tabs = document.querySelectorAll('.tab');
-            tabs.forEach(tab => tab.classList.remove('active'));
+            // 移除所有导航链接的活动状态
+            const navLinks = document.querySelectorAll('.nav-link');
+            navLinks.forEach(link => link.classList.remove('active'));
             
-            // 显示选中的标签内容
-            document.getElementById(tabName).classList.add('active');
-            event.target.classList.add('active');
+            // 显示选中的内容区域
+            document.getElementById(sectionName + '-section').classList.add('active');
+            
+            // 激活对应的导航链接
+            const targetLink = document.querySelector(`[onclick="showSection('${sectionName}')"]`);
+            if (targetLink) {
+                targetLink.classList.add('active');
+            }
+            
+            // 清空全局搜索框
+            clearGlobalSearch();
             
             // 如果是统计页面，重新加载数据
-            if (tabName === 'statistics') {
+            if (sectionName === 'statistics') {
                 loadStatistics();
             }
         }
@@ -957,6 +2286,14 @@ std::string HttpServer::generateIndexPage() {
             users.forEach(user => {
                 const row = tbody.insertRow();
                 row.innerHTML = `
+                    <td class="action-buttons">
+                        <button class="action-btn edit" onclick="editUser(${user.id})" title="编辑">
+                            <i class="fas fa-edit"></i>
+                        </button>
+                        <button class="action-btn delete" onclick="deleteUser(${user.id})" title="删除">
+                            <i class="fas fa-trash"></i>
+                        </button>
+                    </td>
                     <td>${user.id}</td>
                     <td>${user.name}</td>
                     <td>${user.email}</td>
@@ -1020,6 +2357,14 @@ std::string HttpServer::generateIndexPage() {
                 const statusText = book.isAvailable ? '可借阅' : '已借出';
                 
                 row.innerHTML = `
+                    <td class="action-buttons">
+                        <button class="action-btn edit" onclick="editBook(${book.id})" title="编辑">
+                            <i class="fas fa-edit"></i>
+                        </button>
+                        <button class="action-btn delete" onclick="deleteBook(${book.id})" title="删除">
+                            <i class="fas fa-trash"></i>
+                        </button>
+                    </td>
                     <td>${book.id}</td>
                     <td>${book.title}</td>
                     <td>${book.author}</td>
@@ -1166,6 +2511,469 @@ std::string HttpServer::generateIndexPage() {
             
             container.innerHTML = html;
         }
+        
+        // 侧边栏折叠功能
+        function toggleSidebar() {
+            const sidebar = document.getElementById('sidebar');
+            const mainContainer = document.querySelector('.main-container');
+            const topBar = document.querySelector('.top-bar');
+            
+            sidebar.classList.toggle('collapsed');
+            const isCollapsed = sidebar.classList.contains('collapsed');
+            
+            if (isCollapsed) {
+                mainContainer.classList.add('sidebar-collapsed');
+                topBar.classList.add('sidebar-collapsed');
+            } else {
+                mainContainer.classList.remove('sidebar-collapsed');
+                topBar.classList.remove('sidebar-collapsed');
+            }
+            
+            localStorage.setItem('sidebarCollapsed', isCollapsed);
+        }
+        
+        // 全局搜索功能
+        function performGlobalSearch() {
+            const searchTerm = document.getElementById('globalSearch').value.trim();
+            const searchResults = document.getElementById('searchResults');
+            
+            if (searchTerm.length === 0) {
+                searchResults.style.display = 'none';
+                return;
+            }
+            
+            if (searchTerm.length < 2) {
+                return; // 至少输入2个字符才开始搜索
+            }
+            
+            const results = [];
+            const searchTermLower = searchTerm.toLowerCase();
+            
+            // 搜索用户
+            if (allUsers && allUsers.length > 0) {
+                allUsers.forEach(user => {
+                    if (user.name.toLowerCase().includes(searchTermLower) ||
+                        user.email.toLowerCase().includes(searchTermLower) ||
+                        user.phone.toLowerCase().includes(searchTermLower)) {
+                        results.push({
+                            type: 'user',
+                            id: user.id,
+                            title: user.name,
+                            subtitle: user.email,
+                            section: 'users'
+                        });
+                    }
+                });
+            }
+            
+            // 搜索图书
+            if (allBooks && allBooks.length > 0) {
+                allBooks.forEach(book => {
+                    if (book.title.toLowerCase().includes(searchTermLower) ||
+                        book.author.toLowerCase().includes(searchTermLower) ||
+                        (book.category && book.category.toLowerCase().includes(searchTermLower)) ||
+                        (book.keywords && book.keywords.toLowerCase().includes(searchTermLower))) {
+                        results.push({
+                            type: 'book',
+                            id: book.id,
+                            title: book.title,
+                            subtitle: book.author,
+                            section: 'books'
+                        });
+                    }
+                });
+            }
+            
+            displaySearchResults(results);
+        }
+        
+        // 显示搜索结果
+        function displaySearchResults(results) {
+            const searchResults = document.getElementById('searchResults');
+            
+            if (results.length === 0) {
+                searchResults.innerHTML = '<div class="no-results">未找到相关结果</div>';
+            } else {
+                let html = '';
+                results.slice(0, 8).forEach(result => { // 最多显示8个结果
+                    const typeText = result.type === 'user' ? '用户' : '图书';
+                    const icon = result.type === 'user' ? 'fas fa-user' : 'fas fa-book';
+                    
+                    html += `
+                        <div class="search-result-item" onclick="selectSearchResult('${result.section}', ${result.id})">
+                            <div class="search-result-type"><i class="${icon}"></i> ${typeText}</div>
+                            <div class="search-result-title">${result.title}</div>
+                            <div class="search-result-subtitle">${result.subtitle}</div>
+                        </div>
+                    `;
+                });
+                
+                if (results.length > 8) {
+                    html += `<div class="search-result-item" style="text-align: center; color: var(--secondary-color);">还有 ${results.length - 8} 个结果...</div>`;
+                }
+                
+                searchResults.innerHTML = html;
+            }
+            
+            searchResults.style.display = 'block';
+        }
+        
+        // 选择搜索结果
+        function selectSearchResult(section, id) {
+            // 切换到对应页面
+            showSection(section);
+            
+            // 高亮对应的行
+            setTimeout(() => {
+                const table = section === 'users' ? document.getElementById('usersTable') : document.getElementById('booksTable');
+                const rows = table.querySelectorAll('tbody tr');
+                
+                rows.forEach(row => {
+                    row.classList.remove('highlight');
+                    if (parseInt(row.cells[1].textContent) === id) { // ID现在在第二列
+                        row.classList.add('highlight');
+                        row.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                        
+                        // 3秒后移除高亮
+                        setTimeout(() => {
+                            row.classList.remove('highlight');
+                        }, 3000);
+                    }
+                });
+            }, 100);
+            
+            // 隐藏搜索结果
+            document.getElementById('searchResults').style.display = 'none';
+            document.getElementById('globalSearch').blur();
+        }
+        
+        // 显示搜索结果
+        function showSearchResults() {
+            const searchTerm = document.getElementById('globalSearch').value.trim();
+            if (searchTerm.length >= 2) {
+                performGlobalSearch();
+            }
+        }
+        
+        // 隐藏搜索结果（延迟执行以允许点击）
+        function hideSearchResults() {
+            setTimeout(() => {
+                document.getElementById('searchResults').style.display = 'none';
+            }, 200);
+        }
+        
+        // 清空搜索框当切换页面时
+        function clearGlobalSearch() {
+            document.getElementById('globalSearch').value = '';
+            document.getElementById('searchResults').style.display = 'none';
+        }
+        
+        // 用户下拉菜单切换
+        function toggleUserDropdown() {
+            const dropdown = document.getElementById('userDropdown');
+            dropdown.style.display = dropdown.style.display === 'block' ? 'none' : 'block';
+        }
+        
+        // 点击其他地方关闭下拉菜单
+        document.addEventListener('click', function(event) {
+            const dropdown = document.getElementById('userDropdown');
+            const userButton = document.querySelector('.user-button');
+            
+            if (!userButton.contains(event.target) && !dropdown.contains(event.target)) {
+                dropdown.style.display = 'none';
+            }
+        });
+        
+        // 主题切换功能
+        function toggleTheme() {
+            const body = document.body;
+            const themeIcon = document.getElementById('themeIcon');
+            const themeText = document.getElementById('themeText');
+            
+            if (body.getAttribute('data-theme') === 'dark') {
+                body.setAttribute('data-theme', 'light');
+                themeIcon.className = 'fas fa-moon';
+                themeText.textContent = '夜间模式';
+                localStorage.setItem('theme', 'light');
+            } else {
+                body.setAttribute('data-theme', 'dark');
+                themeIcon.className = 'fas fa-sun';
+                themeText.textContent = '日间模式';
+                localStorage.setItem('theme', 'dark');
+            }
+        }
+        
+        // 初始化主题
+        function initTheme() {
+            const savedTheme = localStorage.getItem('theme');
+            const themeIcon = document.getElementById('themeIcon');
+            const themeText = document.getElementById('themeText');
+            
+            if (savedTheme === 'dark') {
+                document.body.setAttribute('data-theme', 'dark');
+                themeIcon.className = 'fas fa-sun';
+                themeText.textContent = '日间模式';
+            } else {
+                document.body.setAttribute('data-theme', 'light');
+                themeIcon.className = 'fas fa-moon';
+                themeText.textContent = '夜间模式';
+            }
+        }
+        
+        // 初始化侧边栏状态
+        function initSidebar() {
+            const sidebarCollapsed = localStorage.getItem('sidebarCollapsed') === 'true';
+            const sidebar = document.getElementById('sidebar');
+            const mainContainer = document.querySelector('.main-container');
+            const topBar = document.querySelector('.top-bar');
+            
+            if (sidebarCollapsed) {
+                sidebar.classList.add('collapsed');
+                mainContainer.classList.add('sidebar-collapsed');
+                topBar.classList.add('sidebar-collapsed');
+            }
+        }
+        
+        // 登录功能
+        function logout() {
+            if (confirm('确定要退出登录吗？')) {
+                localStorage.removeItem('userType');
+                localStorage.removeItem('username');
+                window.location.href = '/login';
+            }
+        }
+        
+        // 检查登录状态
+        function checkLoginStatus() {
+            const userType = localStorage.getItem('userType');
+            const username = localStorage.getItem('username');
+            const currentUserSpan = document.getElementById('currentUser');
+            
+            if (userType && username) {
+                const userTypeText = userType === 'admin' ? '管理员' : '读者';
+                currentUserSpan.textContent = `${userTypeText}: ${username}`;
+            } else {
+                currentUserSpan.textContent = '游客模式';
+            }
+        }
+        
+        // 页面加载完成后初始化
+        document.addEventListener('DOMContentLoaded', function() {
+            initTheme();
+            initSidebar();
+            checkLoginStatus();
+            
+            // 检查是否已登录，如果未登录则重定向到登录页面
+            const userType = localStorage.getItem('userType');
+            const username = localStorage.getItem('username');
+            
+            if (!userType || !username) {
+                window.location.href = '/login';
+                return;
+            }
+            
+            // 如果已登录，则加载数据
+            loadUsers();
+            loadBooks();
+            loadStatistics();
+            
+            // 绑定表单提交事件
+            document.getElementById('borrowForm').addEventListener('submit', handleBorrowSubmit);
+            document.getElementById('returnForm').addEventListener('submit', handleReturnSubmit);
+            document.getElementById('modalForm').addEventListener('submit', handleModalSubmit);
+        });
+        
+        // 弹出卡片相关函数
+        let currentModalType = '';
+        let currentEditId = null;
+        
+        // 打开用户模态框
+        function openUserModal(user = null) {
+            currentModalType = 'user';
+            currentEditId = user ? user.id : null;
+            
+            document.getElementById('modalTitle').textContent = user ? '编辑用户' : '添加用户';
+            document.getElementById('modalSubmitBtn').textContent = user ? '保存' : '添加';
+            
+            const formContent = `
+                <div class="form-group">
+                    <label for="modalUserName">姓名</label>
+                    <input type="text" id="modalUserName" name="name" value="${user ? user.name : ''}" required>
+                </div>
+                <div class="form-group">
+                    <label for="modalUserEmail">邮箱</label>
+                    <input type="email" id="modalUserEmail" name="email" value="${user ? user.email : ''}" required>
+                </div>
+                <div class="form-group">
+                    <label for="modalUserPhone">电话</label>
+                    <input type="tel" id="modalUserPhone" name="phone" value="${user ? user.phone : ''}" required>
+                </div>
+            `;
+            
+            document.getElementById('modalFormContent').innerHTML = formContent;
+            document.getElementById('modalOverlay').style.display = 'flex';
+        }
+        
+        // 打开图书模态框
+        function openBookModal(book = null) {
+            currentModalType = 'book';
+            currentEditId = book ? book.id : null;
+            
+            document.getElementById('modalTitle').textContent = book ? '编辑图书' : '添加图书';
+            document.getElementById('modalSubmitBtn').textContent = book ? '保存' : '添加';
+            
+            const formContent = `
+                <div class="form-group">
+                    <label for="modalBookTitle">书名</label>
+                    <input type="text" id="modalBookTitle" name="title" value="${book ? book.title : ''}" required>
+                </div>
+                <div class="form-group">
+                    <label for="modalBookAuthor">作者</label>
+                    <input type="text" id="modalBookAuthor" name="author" value="${book ? book.author : ''}" required>
+                </div>
+                <div class="form-group">
+                    <label for="modalBookCategory">类别</label>
+                    <input type="text" id="modalBookCategory" name="category" value="${book ? book.category || '' : ''}">
+                </div>
+                <div class="form-group">
+                    <label for="modalBookKeywords">关键字</label>
+                    <input type="text" id="modalBookKeywords" name="keywords" value="${book ? book.keywords || '' : ''}">
+                </div>
+                <div class="form-group">
+                    <label for="modalBookDescription">简介</label>
+                    <textarea id="modalBookDescription" name="description" rows="3">${book ? book.description || '' : ''}</textarea>
+                </div>
+            `;
+            
+            document.getElementById('modalFormContent').innerHTML = formContent;
+            document.getElementById('modalOverlay').style.display = 'flex';
+        }
+        
+        // 关闭模态框
+        function closeModal() {
+            document.getElementById('modalOverlay').style.display = 'none';
+            document.getElementById('modalForm').reset();
+            currentModalType = '';
+            currentEditId = null;
+        }
+        
+        // 处理模态框表单提交
+        async function handleModalSubmit(e) {
+            e.preventDefault();
+            const formData = new FormData(e.target);
+            
+            try {
+                let url, method, messageElementId;
+                
+                if (currentModalType === 'user') {
+                    url = currentEditId ? `/api/users/${currentEditId}` : '/api/users';
+                    method = currentEditId ? 'PUT' : 'POST';
+                    messageElementId = 'userMessage';
+                } else if (currentModalType === 'book') {
+                    url = currentEditId ? `/api/books/${currentEditId}` : '/api/books';
+                    method = currentEditId ? 'PUT' : 'POST';
+                    messageElementId = 'bookMessage';
+                }
+                
+                const response = await fetch(url, {
+                    method: method,
+                    body: formData
+                });
+                
+                const result = await response.json();
+                
+                if (result.success) {
+                    const action = currentEditId ? '更新' : '添加';
+                    const type = currentModalType === 'user' ? '用户' : '图书';
+                    showMessage(messageElementId, `${action}${type}成功`, 'success');
+                    closeModal();
+                    
+                    if (currentModalType === 'user') {
+                        loadUsers();
+                    } else {
+                        loadBooks();
+                    }
+                } else {
+                    const action = currentEditId ? '更新' : '添加';
+                    const type = currentModalType === 'user' ? '用户' : '图书';
+                    showMessage(messageElementId, result.message || `${action}${type}失败`, 'error');
+                }
+            } catch (error) {
+                const messageElementId = currentModalType === 'user' ? 'userMessage' : 'bookMessage';
+                showMessage(messageElementId, '网络错误', 'error');
+            }
+        }
+        
+        // 编辑用户
+        function editUser(userId) {
+            const user = allUsers.find(u => u.id === userId);
+            if (user) {
+                openUserModal(user);
+            }
+        }
+        
+        // 编辑图书
+        function editBook(bookId) {
+            const book = allBooks.find(b => b.id === bookId);
+            if (book) {
+                openBookModal(book);
+            }
+        }
+        
+        // 删除用户
+        async function deleteUser(userId) {
+            if (!confirm('确定要删除这个用户吗？')) {
+                return;
+            }
+            
+            try {
+                const response = await fetch(`/api/users/${userId}`, {
+                    method: 'DELETE'
+                });
+                
+                const result = await response.json();
+                
+                if (result.success) {
+                    showMessage('userMessage', '删除用户成功', 'success');
+                    loadUsers();
+                } else {
+                    showMessage('userMessage', result.message || '删除用户失败', 'error');
+                }
+            } catch (error) {
+                showMessage('userMessage', '网络错误', 'error');
+            }
+        }
+        
+        // 删除图书
+        async function deleteBook(bookId) {
+            if (!confirm('确定要删除这本图书吗？')) {
+                return;
+            }
+            
+            try {
+                const response = await fetch(`/api/books/${bookId}`, {
+                    method: 'DELETE'
+                });
+                
+                const result = await response.json();
+                
+                if (result.success) {
+                    showMessage('bookMessage', '删除图书成功', 'success');
+                    loadBooks();
+                } else {
+                    showMessage('bookMessage', result.message || '删除图书失败', 'error');
+                }
+            } catch (error) {
+                showMessage('bookMessage', '网络错误', 'error');
+            }
+        }
+        
+        // 点击模态框外部关闭
+        document.getElementById('modalOverlay').addEventListener('click', function(e) {
+            if (e.target === this) {
+                closeModal();
+            }
+        });
     </script>
 </body>
 </html>

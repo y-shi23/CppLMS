@@ -35,16 +35,16 @@ int main() {
         // 创建HTTP服务器
         HttpServer server(8080, &library);
         
-        std::cout << "图书管理系统启动中..." << std::endl;
-        std::cout << "服务器运行在: http://localhost:8080" << std::endl;
-        std::cout << "请在浏览器中打开上述地址访问系统" << std::endl;
-        std::cout << "按 Ctrl+C 退出系统" << std::endl;
+        std::cout << "Book Management System is activating..." << std::endl;
+        std::cout << "Running on: http://localhost:8080" << std::endl;
+        std::cout << "Please open browser and vistit 8080" << std::endl;
+        std::cout << "Press Ctrl+C to exit" << std::endl;
         
         // 启动服务器
         server.start();
         
     } catch (const std::exception& e) {
-        std::cerr << "系统启动失败: " << e.what() << std::endl;
+        std::cerr << "Failed: " << e.what() << std::endl;
         return 1;
     }
     
