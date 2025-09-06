@@ -415,28 +415,52 @@ HttpResponse HttpServer::handleApiLogin(const HttpRequest& request) {
         // 根据用户名判断用户类型并验证
         bool loginSuccess = false;
         std::string message = "";
-        std::string userType = "";
+        std::string userType = ""        std::string actualUsername = "";
+        int userId = -1;
         
         // 管理员账户验证
         if (username == "admin" && password == "1234") {
             loginSuccess = true;
             userType = "admin";
+            actualUsername = "admin";
+            userId = 0;
             message = "管理员登录成功";
         }
-        // 预设的读者账户验证
-        else if (username == "reader" && password == "reader123") {
-            loginSuccess = true;
-            userType = "reader";
-            message = "读者登录成功";
-        }
-        // 可以在这里添加更多预设账户或从数据库验证
-        else if (username == "librarian" && password == "lib123") {
-            loginSuccess = true;
-            userType = "admin";
-            message = "图书管理员登录成功";
-        }
         else {
-            message = "用户名或密码错误";
+            // 从users.json验证用户
+            try {
+                std::ifstream file("data/users.json");
+                if (file.is_open()) {
+                    Json::Value usersData;
+                    file >> usersData;
+                    file.close();
+                    
+                    if (usersData.isArray()) {
+                        for (const auto& user : usersData) {
+                            std::string userName = user["name"].asString();
+                            std::string userEmail = user["email"].asString();
+                            
+                            // 支持用户名或邮箱登录，密码暂时使用用户ID
+                            std::string userPassword = std::to_string(user["id"].asInt());
+                            
+                            if ((username == userName || username == userEmail) && password == userPassword) {
+                                loginSuccess = true;
+                                userType = "reader";
+                                actualUsername = userName;
+                                userId = user["id"].asInt();
+                                message = "用户登录成功";
+                                break;
+                            }
+                        }
+                    }
+                }
+            } catch (const std::exception& e) {
+                message = "系统错误，请稍后重试";
+            }
+            
+            if (!loginSuccess) {
+                message = "用户名或密码错误";
+            }
         }
         
         Json::Value result;
@@ -444,7 +468,8 @@ HttpResponse HttpServer::handleApiLogin(const HttpRequest& request) {
         result["message"] = message;
         if (loginSuccess) {
             result["userType"] = userType;
-            result["username"] = username;
+            result["username"] = actualUsername;
+            result["userId"] = userId;
         }
         
         return jsonResponse(result);
@@ -1164,6 +1189,7 @@ std::string HttpServer::generateLoginPage() {
                 if (data.success) {
                     localStorage.setItem('userType', data.userType);
                     localStorage.setItem('username', data.username);
+                    localStorage.setItem('userId', data.userId);
                     window.location.href = '/';
                 } else {
                     showError(data.message || '登录失败，请检查用户名和密码');
@@ -1341,6 +1367,48 @@ std::string HttpServer::generateIndexPage() {
             font-size: 14px;
         }
         
+        .search-dropdown {
+            position: absolute;
+            top: 100%;
+            left: 0;
+            right: 0;
+            background: var(--bg-color);
+            border: 1px solid var(--border-color);
+            border-top: none;
+            border-radius: 0 0 6px 6px;
+            max-height: 200px;
+            overflow-y: auto;
+            z-index: 1000;
+            display: none;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+        }
+        
+        .search-dropdown-item {
+            padding: 8px 12px;
+            border-bottom: 1px solid var(--border-color);
+            cursor: pointer;
+            transition: background-color 0.2s;
+            font-size: 14px;
+        }
+        
+        .search-dropdown-item:hover {
+            background: var(--hover-color);
+        }
+        
+        .search-dropdown-item:last-child {
+            border-bottom: none;
+        }
+        
+        .search-dropdown-item .item-title {
+            font-weight: 500;
+            margin-bottom: 2px;
+        }
+        
+        .search-dropdown-item .item-subtitle {
+            font-size: 12px;
+            color: var(--secondary-color);
+        }
+        
         .data-table tbody tr.highlight {
             background-color: rgba(35, 131, 226, 0.1);
             border-left: 3px solid var(--primary-color);
@@ -1502,8 +1570,8 @@ std::string HttpServer::generateIndexPage() {
         
         .dropdown-menu {
             position: absolute;
-            top: 100%;
-            right: 0;
+            top: calc(100% + 8px);
+            left: 0;
             background-color: var(--bg-color);
             border: 1px solid var(--border-color);
             border-radius: 6px;
@@ -1613,7 +1681,7 @@ std::string HttpServer::generateIndexPage() {
             display: flex;
             align-items: center;
             gap: 12px;
-            padding: 12px 20px;
+            padding: 0 20px;
             color: var(--text-color);
             text-decoration: none;
             transition: all 0.2s ease;
@@ -1624,13 +1692,12 @@ std::string HttpServer::generateIndexPage() {
             text-align: left;
             font-size: 14px;
             position: relative;
-            min-height: 44px;
+            height: 48px;
         }
         
         .sidebar.collapsed .nav-link {
-            padding: 12px;
+            padding: 0 12px;
             justify-content: center;
-            min-height: 44px;
         }
         
         .nav-link:hover {
@@ -1948,6 +2015,206 @@ std::string HttpServer::generateIndexPage() {
             font-size: 14px;
         }
         
+        /* 用户界面样式 */
+        .user-dashboard {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(400px, 1fr));
+            gap: 20px;
+            padding: 20px 0;
+        }
+        
+        .dashboard-card {
+            background: var(--bg-color);
+            border: 1px solid var(--border-color);
+            border-radius: 12px;
+            overflow: hidden;
+            transition: all 0.3s ease;
+            box-shadow: 0 2px 4px rgba(0, 0, 0, 0.05);
+        }
+        
+        .dashboard-card:hover {
+            box-shadow: 0 8px 25px rgba(0, 0, 0, 0.1);
+            transform: translateY(-2px);
+        }
+        
+        .card-header {
+            background: linear-gradient(135deg, var(--primary-color), #4f46e5);
+            color: white;
+            padding: 16px 20px;
+            font-weight: 600;
+        }
+        
+        .card-header h3 {
+            margin: 0;
+            font-size: 16px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        
+        .card-content {
+            padding: 20px;
+            min-height: 200px;
+        }
+        
+        .loading {
+            text-align: center;
+            color: var(--secondary-color);
+            padding: 40px 0;
+        }
+        
+        .search-container {
+            display: flex;
+            gap: 8px;
+            margin-bottom: 16px;
+        }
+        
+        .search-input {
+            flex: 1;
+            padding: 12px;
+            border: 1px solid var(--border-color);
+            border-radius: 6px;
+            font-size: 14px;
+            background-color: var(--bg-color);
+            color: var(--text-color);
+        }
+        
+        .search-btn {
+            padding: 12px 16px;
+            background-color: var(--primary-color);
+            color: white;
+            border: none;
+            border-radius: 6px;
+            cursor: pointer;
+            transition: background-color 0.2s ease;
+        }
+        
+        .search-btn:hover {
+            background-color: #1d4ed8;
+        }
+        
+        .book-results {
+            max-height: 300px;
+            overflow-y: auto;
+        }
+        
+        .book-item {
+            padding: 12px;
+            border: 1px solid var(--border-color);
+            border-radius: 6px;
+            margin-bottom: 8px;
+            background: var(--hover-color);
+        }
+        
+        .book-item h4 {
+            margin: 0 0 4px 0;
+            color: var(--text-color);
+            font-size: 14px;
+        }
+        
+        .book-item p {
+            margin: 0;
+            color: var(--secondary-color);
+            font-size: 12px;
+        }
+        
+        .borrow-item {
+            padding: 12px;
+            border-left: 4px solid var(--primary-color);
+            background: var(--hover-color);
+            margin-bottom: 8px;
+            border-radius: 0 6px 6px 0;
+        }
+        
+        .borrow-item h4 {
+            margin: 0 0 4px 0;
+            color: var(--text-color);
+            font-size: 14px;
+        }
+        
+        .borrow-item p {
+            margin: 0;
+            color: var(--secondary-color);
+            font-size: 12px;
+        }
+        
+        .stats-item {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 12px 0;
+            border-bottom: 1px solid var(--border-color);
+        }
+        
+        .stats-item:last-child {
+            border-bottom: none;
+        }
+        
+        .stats-label {
+            color: var(--text-color);
+            font-weight: 500;
+        }
+        
+        .stats-value {
+            color: var(--primary-color);
+            font-weight: 600;
+        }
+        
+        .heatmap-card {
+            grid-column: 1 / -1;
+        }
+        
+        .heatmap-container {
+            min-height: 300px;
+            background: var(--hover-color);
+            border-radius: 8px;
+            padding: 20px;
+            text-align: center;
+        }
+        
+        .heatmap-grid {
+            display: grid;
+            grid-template-columns: repeat(7, 1fr);
+            gap: 2px;
+            max-width: 800px;
+            margin: 0 auto;
+        }
+        
+        .heatmap-day {
+            aspect-ratio: 1;
+            border-radius: 2px;
+            cursor: pointer;
+            transition: all 0.2s ease;
+            position: relative;
+            min-height: 12px;
+        }
+        
+        .heatmap-day:hover {
+            transform: scale(1.1);
+            z-index: 10;
+        }
+        
+        .heatmap-tooltip {
+            position: absolute;
+            bottom: 100%;
+            left: 50%;
+            transform: translateX(-50%);
+            background: var(--text-color);
+            color: var(--bg-color);
+            padding: 4px 8px;
+            border-radius: 4px;
+            font-size: 12px;
+            white-space: nowrap;
+            opacity: 0;
+            pointer-events: none;
+            transition: opacity 0.2s ease;
+            z-index: 1000;
+        }
+        
+        .heatmap-day:hover .heatmap-tooltip {
+            opacity: 1;
+        }
+        
         @media (max-width: 768px) {
             .sidebar {
                 width: 100%;
@@ -1988,6 +2255,15 @@ std::string HttpServer::generateIndexPage() {
                 font-size: 10px;
                 padding: 4px 8px;
             }
+            
+            .user-dashboard {
+                grid-template-columns: 1fr;
+                gap: 16px;
+            }
+            
+            .dashboard-card {
+                min-width: unset;
+            }
         }
     </style>
 </head>
@@ -2014,8 +2290,6 @@ std::string HttpServer::generateIndexPage() {
                         <i class="fas fa-sign-out-alt"></i>
                         退出登录
                     </button>
-                </div>
-            </div>
         </div>
     </div>
     
@@ -2042,15 +2316,9 @@ std::string HttpServer::generateIndexPage() {
                 </button>
             </div>
             <div class="nav-item">
-                <button class="nav-link" onclick="showSection('borrow')" data-tooltip="借阅管理">
-                    <i class="fas fa-hand-holding"></i>
-                    <span>借阅管理</span>
-                </button>
-            </div>
-            <div class="nav-item">
-                <button class="nav-link" onclick="showSection('return')" data-tooltip="归还管理">
-                    <i class="fas fa-undo"></i>
-                    <span>归还管理</span>
+                <button class="nav-link" onclick="showSection('borrow-return')" data-tooltip="借阅归还管理">
+                    <i class="fas fa-exchange-alt"></i>
+                    <span>借阅归还管理</span>
                 </button>
             </div>
             <div class="nav-item">
@@ -2062,9 +2330,11 @@ std::string HttpServer::generateIndexPage() {
         </nav>
     </div>
     
-    <!-- 主内容区域 -->
-    <div class="main-container">
-        <div class="content-area">
+    <!-- 管理员界面 -->
+    <div id="admin-interface" style="display: block;">
+        <!-- 主内容区域 -->
+        <div class="main-container">
+            <div class="content-area">
             <!-- 用户管理 -->
             <div id="users-section" class="content-section active">
                 <div class="section">
@@ -2115,41 +2385,65 @@ std::string HttpServer::generateIndexPage() {
                 </div>
             </div>
             
-            <!-- 借阅管理 -->
-            <div id="borrow-section" class="content-section">
+            <!-- 借阅归还管理 -->
+            <div id="borrow-return-section" class="content-section">
                 <div class="section">
-                    <h2><i class="fas fa-hand-holding"></i> 借阅管理</h2>
-                    <div id="borrowMessage" class="message"></div>
-                    <form id="borrowForm">
-                        <div class="form-group">
-                            <label for="borrowUserId">用户ID</label>
-                            <input type="number" id="borrowUserId" name="userId" required>
+                    <h2><i class="fas fa-exchange-alt"></i> 借阅归还管理</h2>
+                    <div id="borrowReturnMessage" class="message"></div>
+                    
+                    <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 24px; margin-top: 20px;">
+                        <!-- 借阅管理 -->
+                        <div style="border: 1px solid var(--border-color); border-radius: 8px; padding: 20px;">
+                            <h3 style="margin-bottom: 16px; color: var(--primary-color); display: flex; align-items: center; gap: 8px;">
+                                <i class="fas fa-hand-holding"></i> 借阅图书
+                            </h3>
+                            <form id="borrowForm">
+                                <div class="form-group">
+                                    <label for="borrowUserInput">用户ID或姓名</label>
+                                    <div style="position: relative;">
+                                        <input type="text" id="borrowUserInput" placeholder="输入用户ID或姓名搜索..." required autocomplete="off">
+                                        <div class="search-dropdown" id="borrowUserDropdown"></div>
+                                    </div>
+                                    <input type="hidden" id="borrowUserId" name="userId">
+                                </div>
+                                <div class="form-group">
+                                    <label for="borrowBookInput">图书ID或书名</label>
+                                    <div style="position: relative;">
+                                        <input type="text" id="borrowBookInput" placeholder="输入图书ID或书名搜索..." required autocomplete="off">
+                                        <div class="search-dropdown" id="borrowBookDropdown"></div>
+                                    </div>
+                                    <input type="hidden" id="borrowBookId" name="bookId">
+                                </div>
+                                <button type="submit" class="btn btn-primary">借阅图书</button>
+                            </form>
                         </div>
-                        <div class="form-group">
-                            <label for="borrowBookId">图书ID</label>
-                            <input type="number" id="borrowBookId" name="bookId" required>
+                        
+                        <!-- 归还管理 -->
+                        <div style="border: 1px solid var(--border-color); border-radius: 8px; padding: 20px;">
+                            <h3 style="margin-bottom: 16px; color: var(--success-color); display: flex; align-items: center; gap: 8px;">
+                                <i class="fas fa-undo"></i> 归还图书
+                            </h3>
+                            <form id="returnForm">
+                                <div class="form-group">
+                                    <label for="returnUserInput">用户ID或姓名</label>
+                                    <div style="position: relative;">
+                                        <input type="text" id="returnUserInput" placeholder="输入用户ID或姓名搜索..." required autocomplete="off">
+                                        <div class="search-dropdown" id="returnUserDropdown"></div>
+                                    </div>
+                                    <input type="hidden" id="returnUserId" name="userId">
+                                </div>
+                                <div class="form-group">
+                                    <label for="returnBookInput">图书ID或书名</label>
+                                    <div style="position: relative;">
+                                        <input type="text" id="returnBookInput" placeholder="输入图书ID或书名搜索..." required autocomplete="off">
+                                        <div class="search-dropdown" id="returnBookDropdown"></div>
+                                    </div>
+                                    <input type="hidden" id="returnBookId" name="bookId">
+                                </div>
+                                <button type="submit" class="btn btn-success">归还图书</button>
+                            </form>
                         </div>
-                        <button type="submit" class="btn btn-primary">借阅图书</button>
-                    </form>
-                </div>
-            </div>
-            
-            <!-- 归还管理 -->
-            <div id="return-section" class="content-section">
-                <div class="section">
-                    <h2><i class="fas fa-undo"></i> 归还管理</h2>
-                    <div id="returnMessage" class="message"></div>
-                    <form id="returnForm">
-                        <div class="form-group">
-                            <label for="returnUserId">用户ID</label>
-                            <input type="number" id="returnUserId" name="userId" required>
-                        </div>
-                        <div class="form-group">
-                            <label for="returnBookId">图书ID</label>
-                            <input type="number" id="returnBookId" name="bookId" required>
-                        </div>
-                        <button type="submit" class="btn btn-success">归还图书</button>
-                    </form>
+                    </div>
                 </div>
             </div>
             
@@ -2194,6 +2488,71 @@ std::string HttpServer::generateIndexPage() {
                         <button type="submit" class="btn" id="modalSubmitBtn">确定</button>
                     </div>
                 </form>
+            </div>
+        </div>
+    </div>
+    </div> <!-- 关闭管理员界面 -->
+    
+    <!-- 用户界面 -->
+    <div id="user-interface" style="display: none; margin-left: 0; width: 100%; padding: 20px;">
+        <!-- 用户面板 -->
+        <div class="user-dashboard">
+                    <!-- 当前借阅 -->
+                    <div class="dashboard-card">
+                        <div class="card-header">
+                            <h3><i class="fas fa-book-open"></i> 当前借阅</h3>
+                        </div>
+                        <div class="card-content" id="currentBorrowings">
+                            <div class="loading">加载中...</div>
+                        </div>
+                    </div>
+                    
+                    <!-- 历史借阅 -->
+                    <div class="dashboard-card">
+                        <div class="card-header">
+                            <h3><i class="fas fa-history"></i> 历史借阅</h3>
+                        </div>
+                        <div class="card-content" id="borrowHistory">
+                            <div class="loading">加载中...</div>
+                        </div>
+                    </div>
+                    
+                    <!-- 借阅时长统计 -->
+                    <div class="dashboard-card">
+                        <div class="card-header">
+                            <h3><i class="fas fa-chart-bar"></i> 借阅时长统计</h3>
+                        </div>
+                        <div class="card-content" id="borrowStats">
+                            <div class="loading">加载中...</div>
+                        </div>
+                    </div>
+                    
+                    <!-- 图书检索 -->
+                    <div class="dashboard-card">
+                        <div class="card-header">
+                            <h3><i class="fas fa-search"></i> 图书检索</h3>
+                        </div>
+                        <div class="card-content">
+                            <div class="search-container">
+                                <input type="text" id="userBookSearch" placeholder="搜索图书标题、作者或分类..." class="search-input">
+                                <button onclick="searchBooksForUser()" class="search-btn">
+                                    <i class="fas fa-search"></i>
+                                </button>
+                            </div>
+                            <div id="userBookResults" class="book-results"></div>
+                        </div>
+                    </div>
+                    
+                    <!-- 图书热力图 -->
+                    <div class="dashboard-card heatmap-card">
+                        <div class="card-header">
+                            <h3><i class="fas fa-fire"></i> 图书热力图</h3>
+                        </div>
+                        <div class="card-content">
+                            <div id="heatmap" class="heatmap-container"></div>
+                        </div>
+                    </div>
+                </div>
             </div>
         </div>
     </div>
@@ -2387,7 +2746,17 @@ std::string HttpServer::generateIndexPage() {
         // 借阅管理
         async function handleBorrowSubmit(e) {
             e.preventDefault();
-            const formData = new FormData(e.target);
+            const userId = document.getElementById('borrowUserId').value;
+            const bookId = document.getElementById('borrowBookId').value;
+            
+            if (!userId || !bookId) {
+                showMessage('borrowReturnMessage', '请选择用户和图书', 'error');
+                return;
+            }
+            
+            const formData = new FormData();
+            formData.append('userId', userId);
+            formData.append('bookId', bookId);
             
             try {
                 const response = await fetch('/api/borrow', {
@@ -2398,22 +2767,34 @@ std::string HttpServer::generateIndexPage() {
                 const result = await response.json();
                 
                 if (result.success) {
-                    showMessage('borrowMessage', result.message, 'success');
+                    showMessage('borrowReturnMessage', result.message, 'success');
                     e.target.reset();
+                    document.getElementById('borrowUserId').value = '';
+                    document.getElementById('borrowBookId').value = '';
                     loadUsers();
                     loadBooks();
                 } else {
-                    showMessage('borrowMessage', result.message || '借阅失败', 'error');
+                    showMessage('borrowReturnMessage', result.message || '借阅失败', 'error');
                 }
             } catch (error) {
-                showMessage('borrowMessage', '网络错误', 'error');
+                showMessage('borrowReturnMessage', '网络错误', 'error');
             }
         }
         
         // 归还管理
         async function handleReturnSubmit(e) {
             e.preventDefault();
-            const formData = new FormData(e.target);
+            const userId = document.getElementById('returnUserId').value;
+            const bookId = document.getElementById('returnBookId').value;
+            
+            if (!userId || !bookId) {
+                showMessage('borrowReturnMessage', '请选择用户和图书', 'error');
+                return;
+            }
+            
+            const formData = new FormData();
+            formData.append('userId', userId);
+            formData.append('bookId', bookId);
             
             try {
                 const response = await fetch('/api/return', {
@@ -2424,15 +2805,17 @@ std::string HttpServer::generateIndexPage() {
                 const result = await response.json();
                 
                 if (result.success) {
-                    showMessage('returnMessage', result.message, 'success');
+                    showMessage('borrowReturnMessage', result.message, 'success');
                     e.target.reset();
+                    document.getElementById('returnUserId').value = '';
+                    document.getElementById('returnBookId').value = '';
                     loadUsers();
                     loadBooks();
                 } else {
-                    showMessage('returnMessage', result.message || '归还失败', 'error');
+                    showMessage('borrowReturnMessage', result.message || '归还失败', 'error');
                 }
             } catch (error) {
-                showMessage('returnMessage', '网络错误', 'error');
+                showMessage('borrowReturnMessage', '网络错误', 'error');
             }
         }
         
@@ -2752,12 +3135,565 @@ std::string HttpServer::generateIndexPage() {
             if (userType && username) {
                 const userTypeText = userType === 'admin' ? '管理员' : '读者';
                 currentUserSpan.textContent = `${userTypeText}: ${username}`;
+                
+                // 根据用户类型显示不同界面
+                if (userType === 'reader') {
+                    showUserInterface();
+                } else {
+                    showAdminInterface();
+                }
             } else {
                 currentUserSpan.textContent = '游客模式';
             }
         }
         
+        // 显示管理员界面
+        function showAdminInterface() {
+            document.getElementById('admin-interface').style.display = 'block';
+            document.getElementById('user-interface').style.display = 'none';
+        }
+        
+        // 显示用户界面
+        function showUserInterface() {
+            document.getElementById('admin-interface').style.display = 'none';
+            document.getElementById('user-interface').style.display = 'block';
+            loadUserData();
+        }
+        
+        // 加载用户数据
+        async function loadUserData() {
+            const userId = localStorage.getItem('userId');
+            if (!userId) return;
+            
+            try {
+                // 加载当前借阅
+                await loadCurrentBorrowings(parseInt(userId));
+                // 加载历史借阅
+                await loadBorrowHistory(parseInt(userId));
+                // 加载借阅统计
+                await loadBorrowStats(parseInt(userId));
+                // 加载热力图
+                await loadHeatmap();
+            } catch (error) {
+                console.error('加载用户数据失败:', error);
+            }
+        }
+        
+        // 加载当前借阅
+        async function loadCurrentBorrowings(userId) {
+            const container = document.getElementById('currentBorrowings');
+            try {
+                // 获取用户信息
+                const usersResponse = await fetch('/data/users.json');
+                const users = await usersResponse.json();
+                const currentUser = users.find(user => user.id === userId);
+                
+                if (!currentUser) {
+                    container.innerHTML = '<div style="text-align: center; color: var(--error-color); padding: 20px;">用户不存在</div>';
+                    return;
+                }
+                
+                // 获取借阅记录
+                const recordsResponse = await fetch('/data/records.json');
+                const records = await recordsResponse.json();
+                
+                // 获取图书信息
+                const booksResponse = await fetch('/data/books.json');
+                const books = await booksResponse.json();
+                
+                // 筛选当前用户的未归还借阅记录
+                const currentBorrowings = records.filter(record => 
+                    record.userId === currentUser.id && !record.isReturned
+                );
+                
+                if (currentBorrowings.length === 0) {
+                    container.innerHTML = '<div style="text-align: center; color: var(--secondary-color); padding: 20px;">暂无借阅记录</div>';
+                } else {
+                    let html = '';
+                    currentBorrowings.forEach(record => {
+                        const book = books.find(b => b.id === record.bookId);
+                        const borrowDate = new Date(record.borrowTime * 1000);
+                        const dueDate = new Date(borrowDate.getTime() + 30 * 24 * 60 * 60 * 1000); // 假设借期30天
+                        const daysLeft = Math.ceil((dueDate - new Date()) / (1000 * 60 * 60 * 24));
+                        const statusClass = daysLeft < 0 ? 'overdue' : daysLeft <= 3 ? 'due-soon' : 'normal';
+                        
+                        html += `
+                            <div class="borrow-item ${statusClass}">
+                                <h4>${book ? book.title : '未知图书'}</h4>
+                                <p>借阅日期: ${borrowDate.toLocaleDateString()}</p>
+                                <p>应还日期: ${dueDate.toLocaleDateString()}</p>
+                                <p class="status">${daysLeft < 0 ? '已逾期' + Math.abs(daysLeft) + '天' : daysLeft <= 3 ? '即将到期' : '还有' + daysLeft + '天'}</p>
+                            </div>
+                        `;
+                    });
+                    container.innerHTML = html;
+                }
+            } catch (error) {
+                console.error('加载当前借阅失败:', error);
+                container.innerHTML = '<div style="text-align: center; color: var(--error-color);">加载失败</div>';
+            }
+        }
+        
+        // 加载历史借阅
+        async function loadBorrowHistory(userId) {
+            const container = document.getElementById('borrowHistory');
+            try {
+                // 获取用户信息
+                const usersResponse = await fetch('/data/users.json');
+                const users = await usersResponse.json();
+                const currentUser = users.find(user => user.id === userId);
+                
+                if (!currentUser) {
+                    container.innerHTML = '<div style="text-align: center; color: var(--error-color); padding: 20px;">用户不存在</div>';
+                    return;
+                }
+                
+                // 获取借阅记录
+                const recordsResponse = await fetch('/data/records.json');
+                const records = await recordsResponse.json();
+                
+                // 获取图书信息
+                const booksResponse = await fetch('/data/books.json');
+                const books = await booksResponse.json();
+                
+                // 筛选当前用户的已归还借阅记录
+                const historyRecords = records.filter(record => 
+                    record.userId === currentUser.id && record.isReturned
+                );
+                
+                if (historyRecords.length === 0) {
+                    container.innerHTML = '<div style="text-align: center; color: var(--secondary-color); padding: 20px;">暂无历史记录</div>';
+                } else {
+                    let html = '';
+                    historyRecords.slice(0, 5).forEach(record => {
+                        const book = books.find(b => b.id === record.bookId);
+                        const borrowDate = new Date(record.borrowTime * 1000);
+                        const returnDate = record.returnTime ? new Date(record.returnTime * 1000) : null;
+                        
+                        html += `
+                            <div class="borrow-item">
+                                <h4>${book ? book.title : '未知图书'}</h4>
+                                <p>借阅日期: ${borrowDate.toLocaleDateString()}</p>
+                                <p>归还日期: ${returnDate ? returnDate.toLocaleDateString() : '未归还'}</p>
+                            </div>
+                        `;
+                    });
+                    if (historyRecords.length > 5) {
+                        html += `<div style="text-align: center; color: var(--secondary-color); padding: 10px;">还有 ${historyRecords.length - 5} 条记录...</div>`;
+                    }
+                    container.innerHTML = html;
+                }
+            } catch (error) {
+                console.error('加载历史借阅失败:', error);
+                container.innerHTML = '<div style="text-align: center; color: var(--error-color);">加载失败</div>';
+            }
+        }
+        
+        // 加载借阅统计
+        async function loadBorrowStats(userId) {
+            const container = document.getElementById('borrowStats');
+            try {
+                // 获取用户信息
+                const usersResponse = await fetch('/data/users.json');
+                const users = await usersResponse.json();
+                const currentUser = users.find(user => user.id === userId);
+                
+                if (!currentUser) {
+                    container.innerHTML = '<div style="text-align: center; color: var(--error-color); padding: 20px;">用户不存在</div>';
+                    return;
+                }
+                
+                // 获取借阅记录
+                const recordsResponse = await fetch('/data/records.json');
+                const records = await recordsResponse.json();
+                
+                // 筛选当前用户的借阅记录
+                const userRecords = records.filter(record => record.userId === currentUser.id);
+                
+                // 计算统计数据
+                const totalBorrows = userRecords.length;
+                const currentBorrows = userRecords.filter(record => !record.isReturned).length;
+                
+                // 计算平均借阅天数（仅计算已归还的记录）
+                const returnedRecords = userRecords.filter(record => record.isReturned && record.returnTime);
+                let avgBorrowDays = 0;
+                if (returnedRecords.length > 0) {
+                    const totalDays = returnedRecords.reduce((sum, record) => {
+                        const borrowTime = record.borrowTime * 1000;
+                        const returnTime = record.returnTime * 1000;
+                        const days = Math.ceil((returnTime - borrowTime) / (1000 * 60 * 60 * 24));
+                        return sum + days;
+                    }, 0);
+                    avgBorrowDays = Math.round(totalDays / returnedRecords.length);
+                }
+                
+                // 计算逾期次数（假设借期30天）
+                let overdueCount = 0;
+                userRecords.forEach(record => {
+                    const borrowTime = record.borrowTime * 1000;
+                    const dueTime = borrowTime + 30 * 24 * 60 * 60 * 1000; // 30天后
+                    
+                    if (record.isReturned && record.returnTime) {
+                        // 已归还，检查是否逾期归还
+                        if (record.returnTime * 1000 > dueTime) {
+                            overdueCount++;
+                        }
+                    } else {
+                        // 未归还，检查是否已逾期
+                        if (Date.now() > dueTime) {
+                            overdueCount++;
+                        }
+                    }
+                });
+                
+                let html = `
+                    <div class="stats-item">
+                        <span class="stats-label">总借阅次数</span>
+                        <span class="stats-value">${totalBorrows}</span>
+                    </div>
+                    <div class="stats-item">
+                        <span class="stats-label">当前借阅</span>
+                        <span class="stats-value">${currentBorrows}</span>
+                    </div>
+                    <div class="stats-item">
+                        <span class="stats-label">平均借阅天数</span>
+                        <span class="stats-value">${avgBorrowDays} 天</span>
+                    </div>
+                    <div class="stats-item">
+                        <span class="stats-label">逾期次数</span>
+                        <span class="stats-value">${overdueCount}</span>
+                    </div>
+                `;
+                container.innerHTML = html;
+            } catch (error) {
+                console.error('加载借阅统计失败:', error);
+                container.innerHTML = '<div style="text-align: center; color: var(--error-color);">加载失败</div>';
+            }
+        }
+        
+        // 用户图书搜索
+        async function searchBooksForUser() {
+            const searchTerm = document.getElementById('userBookSearch').value.trim();
+            const container = document.getElementById('userBookResults');
+            
+            if (!searchTerm) {
+                container.innerHTML = '';
+                return;
+            }
+            
+            try {
+                // 获取图书信息
+                const booksResponse = await fetch('/data/books.json');
+                const books = await booksResponse.json();
+                
+                // 搜索图书
+                const filteredBooks = books.filter(book => 
+                    book.title.toLowerCase().includes(searchTerm.toLowerCase()) ||
+                    book.author.toLowerCase().includes(searchTerm.toLowerCase()) ||
+                    (book.category && book.category.toLowerCase().includes(searchTerm.toLowerCase())) ||
+                    (book.keywords && book.keywords.toLowerCase().includes(searchTerm.toLowerCase()))
+                );
+                
+                if (filteredBooks.length === 0) {
+                    container.innerHTML = '<div style="text-align: center; color: var(--secondary-color); padding: 20px;">未找到相关图书</div>';
+                } else {
+                    let html = '';
+                    filteredBooks.forEach(book => {
+                        const statusClass = book.isAvailable ? 'available' : 'borrowed';
+                        const statusText = book.isAvailable ? '可借阅' : '已借出';
+                        
+                        html += `
+                            <div class="book-item ${statusClass}">
+                                <h4>${book.title}</h4>
+                                <p>作者: ${book.author}</p>
+                                <p>分类: ${book.category || '未分类'}</p>
+                                <p>描述: ${book.description || '暂无描述'}</p>
+                                <p class="status">状态: ${statusText}</p>
+                            </div>
+                        `;
+                    });
+                    container.innerHTML = html;
+                }
+            } catch (error) {
+                console.error('搜索图书失败:', error);
+                container.innerHTML = '<div style="text-align: center; color: var(--error-color);">搜索失败</div>';
+            }
+        }
+        
+        // 加载热力图
+        async function loadHeatmap() {
+            const container = document.getElementById('heatmap');
+            try {
+                const response = await fetch('/data/records.json');
+                if (response.ok) {
+                    const records = await response.json();
+                    
+                    // 处理借阅记录数据，生成热力图数据
+                    const heatmapData = processRecordsForHeatmap(records);
+                    
+                    // 生成热力图
+                    generateHeatmap(container, heatmapData);
+                } else {
+                    // 如果没有数据文件，生成示例热力图
+                    const sampleData = generateSampleHeatmapData();
+                    generateHeatmap(container, sampleData);
+                }
+            } catch (error) {
+                // 生成示例热力图
+                const sampleData = generateSampleHeatmapData();
+                generateHeatmap(container, sampleData);
+            }
+        }
+        
+        // 生成示例热力图数据
+        function generateSampleHeatmapData() {
+            const data = {};
+            const currentDate = new Date();
+            const startDate = new Date(currentDate.getFullYear(), 0, 1);
+            
+            // 随机生成一些借阅数据
+            const books = ['JavaScript高级程序设计', '算法导论', '深入理解计算机系统', '设计模式', '数据结构与算法'];
+            
+            for (let i = 0; i < 50; i++) {
+                const randomDate = new Date(startDate.getTime() + Math.random() * (currentDate.getTime() - startDate.getTime()));
+                const dateStr = randomDate.toISOString().split('T')[0];
+                
+                if (!data[dateStr]) {
+                    data[dateStr] = [];
+                }
+                
+                const randomBook = books[Math.floor(Math.random() * books.length)];
+                data[dateStr].push(randomBook);
+            }
+            
+            return data;
+        }
+        
+        // 处理借阅记录为热力图数据
+        function processRecordsForHeatmap(records) {
+            const heatmapData = {};
+            const currentDate = new Date();
+            
+            records.forEach(record => {
+                if (record.borrowDate && !record.returnDate) {
+                    // 只处理当前正在借阅的记录
+                    const borrowDate = new Date(record.borrowDate);
+                    const endDate = record.dueDate ? new Date(record.dueDate) : currentDate;
+                    
+                    // 为借阅期间的每一天添加图书记录
+                    for (let date = new Date(borrowDate); date <= endDate && date <= currentDate; date.setDate(date.getDate() + 1)) {
+                        const dateStr = date.toISOString().split('T')[0];
+                        if (!heatmapData[dateStr]) {
+                            heatmapData[dateStr] = [];
+                        }
+                        heatmapData[dateStr].push(record.bookTitle || '未知图书');
+                    }
+                }
+            });
+            
+            return heatmapData;
+        }
+        
+        // 生成热力图
+        function generateHeatmap(container, data) {
+            const currentYear = new Date().getFullYear();
+            
+            let html = `
+                <div class="heatmap-header" style="margin-bottom: 20px; text-align: center;">
+                    <h4 style="margin: 0 0 10px 0; color: var(--text-color);">图书借阅热力图 - ${currentYear}</h4>
+                    <div class="heatmap-legend" style="display: flex; align-items: center; justify-content: center; gap: 10px; font-size: 12px; color: var(--secondary-color);">
+                        <span>少</span>
+                        <div class="legend-colors" style="display: flex; gap: 2px;">
+                            <div class="legend-item level-0" style="width: 10px; height: 10px; background-color: #ebedf0; border-radius: 2px;" title="无借阅"></div>
+                            <div class="legend-item level-1" style="width: 10px; height: 10px; background-color: #9be9a8; border-radius: 2px;" title="1本书"></div>
+                            <div class="legend-item level-2" style="width: 10px; height: 10px; background-color: #40c463; border-radius: 2px;" title="2本书"></div>
+                            <div class="legend-item level-3" style="width: 10px; height: 10px; background-color: #30a14e; border-radius: 2px;" title="3本书"></div>
+                            <div class="legend-item level-4" style="width: 10px; height: 10px; background-color: #216e39; border-radius: 2px;" title="4+本书"></div>
+                        </div>
+                        <span>多</span>
+                    </div>
+                </div>
+                <div class="heatmap-grid" style="display: flex; gap: 2px; overflow-x: auto; padding: 10px;">
+            `;
+            
+            // 生成一年的日历格子，按周排列
+            const startDate = new Date(currentYear, 0, 1);
+            const endDate = new Date(currentYear, 11, 31);
+            
+            // 计算第一周的开始日期（周日开始）
+            const firstWeekStart = new Date(startDate);
+            firstWeekStart.setDate(startDate.getDate() - startDate.getDay());
+            
+            // 计算最后一周的结束日期
+            const lastWeekEnd = new Date(endDate);
+            lastWeekEnd.setDate(endDate.getDate() + (6 - endDate.getDay()));
+            
+            // 按周生成日历
+            for (let weekStart = new Date(firstWeekStart); weekStart <= lastWeekEnd; weekStart.setDate(weekStart.getDate() + 7)) {
+                html += '<div class="week-column" style="display: flex; flex-direction: column; gap: 2px;">';
+                
+                // 为每周的7天创建单元格
+                for (let dayOffset = 0; dayOffset < 7; dayOffset++) {
+                    const currentDate = new Date(weekStart);
+                    currentDate.setDate(weekStart.getDate() + dayOffset);
+                    
+                    const dateStr = currentDate.toISOString().split('T')[0];
+                    const isCurrentYear = currentDate.getFullYear() === currentYear;
+                    
+                    const books = data[dateStr] || [];
+                    const level = Math.min(books.length, 4);
+                    
+                    let tooltip = `${dateStr}\n`;
+                    if (books.length === 0) {
+                        tooltip += '无借阅记录';
+                    } else {
+                        tooltip += `${books.length} 本书:\n${books.join('\n')}`;
+                    }
+                    
+                    const levelColors = {
+                        0: '#ebedf0',
+                        1: '#9be9a8',
+                        2: '#40c463',
+                        3: '#30a14e',
+                        4: '#216e39'
+                    };
+                    
+                    const opacity = isCurrentYear ? '1' : '0.3';
+                    
+                    html += `
+                        <div class="heatmap-day" 
+                             style="width: 12px; height: 12px; background-color: ${levelColors[level]}; border-radius: 2px; cursor: pointer; opacity: ${opacity};" 
+                             title="${tooltip}">
+                        </div>
+                    `;
+                }
+                
+                html += '</div>';
+            }
+            
+            html += '</div>';
+            container.innerHTML = html;
+        }
+        
         // 页面加载完成后初始化
+        // 设置搜索下拉框功能
+        
+        // 为用户界面的搜索框添加事件监听器
+        const userBookSearchInput = document.getElementById('userBookSearch');
+        if (userBookSearchInput) {
+            userBookSearchInput.addEventListener('input', searchBooksForUser);
+            userBookSearchInput.addEventListener('keypress', function(e) {
+                if (e.key === 'Enter') {
+                    searchBooksForUser();
+                }
+            });
+        }
+        function setupSearchDropdown(inputId, dropdownId, hiddenInputId, type) {
+            const input = document.getElementById(inputId);
+            const dropdown = document.getElementById(dropdownId);
+            const hiddenInput = document.getElementById(hiddenInputId);
+            
+            let searchTimeout;
+            
+            input.addEventListener('input', function() {
+                const searchTerm = this.value.trim();
+                
+                clearTimeout(searchTimeout);
+                
+                if (searchTerm.length === 0) {
+                    dropdown.style.display = 'none';
+                    hiddenInput.value = '';
+                    return;
+                }
+                
+                if (searchTerm.length < 2) {
+                    return;
+                }
+                
+                searchTimeout = setTimeout(() => {
+                    performDropdownSearch(searchTerm, dropdown, hiddenInput, type, input);
+                }, 300);
+            });
+            
+            input.addEventListener('blur', function() {
+                // 延迟隐藏下拉框，以便点击事件能够触发
+                setTimeout(() => {
+                    dropdown.style.display = 'none';
+                }, 200);
+            });
+            
+            input.addEventListener('focus', function() {
+                if (this.value.trim().length >= 2) {
+                    performDropdownSearch(this.value.trim(), dropdown, hiddenInput, type, input);
+                }
+            });
+        }
+        
+        // 执行下拉框搜索
+        function performDropdownSearch(searchTerm, dropdown, hiddenInput, type, input) {
+            const searchTermLower = searchTerm.toLowerCase();
+            let results = [];
+            
+            if (type === 'user' && allUsers) {
+                results = allUsers.filter(user => 
+                    user.id.toString().includes(searchTerm) ||
+                    user.name.toLowerCase().includes(searchTermLower) ||
+                    user.email.toLowerCase().includes(searchTermLower)
+                ).slice(0, 10);
+            } else if (type === 'book' && allBooks) {
+                results = allBooks.filter(book => 
+                    book.id.toString().includes(searchTerm) ||
+                    book.title.toLowerCase().includes(searchTermLower) ||
+                    book.author.toLowerCase().includes(searchTermLower)
+                ).slice(0, 10);
+            }
+            
+            displayDropdownResults(results, dropdown, hiddenInput, type, input);
+        }
+        
+        // 显示下拉框搜索结果
+        function displayDropdownResults(results, dropdown, hiddenInput, type, input) {
+            dropdown.innerHTML = '';
+            
+            if (results.length === 0) {
+                dropdown.innerHTML = '<div class="search-dropdown-item">未找到匹配结果</div>';
+                dropdown.style.display = 'block';
+                return;
+            }
+            
+            results.forEach(item => {
+                const div = document.createElement('div');
+                div.className = 'search-dropdown-item';
+                
+                if (type === 'user') {
+                    div.innerHTML = `
+                        <div class="item-title">${item.name}</div>
+                        <div class="item-subtitle">ID: ${item.id} | ${item.email}</div>
+                    `;
+                } else if (type === 'book') {
+                    div.innerHTML = `
+                        <div class="item-title">${item.title}</div>
+                        <div class="item-subtitle">ID: ${item.id} | 作者: ${item.author}</div>
+                    `;
+                }
+                
+                div.addEventListener('click', function() {
+                    if (type === 'user') {
+                        input.value = `${item.name} (ID: ${item.id})`;
+                        hiddenInput.value = item.id;
+                    } else if (type === 'book') {
+                        input.value = `${item.title} (ID: ${item.id})`;
+                        hiddenInput.value = item.id;
+                    }
+                    dropdown.style.display = 'none';
+                });
+                
+                dropdown.appendChild(div);
+            });
+            
+            dropdown.style.display = 'block';
+        }
+        
         document.addEventListener('DOMContentLoaded', function() {
             initTheme();
             initSidebar();
@@ -2781,6 +3717,12 @@ std::string HttpServer::generateIndexPage() {
             document.getElementById('borrowForm').addEventListener('submit', handleBorrowSubmit);
             document.getElementById('returnForm').addEventListener('submit', handleReturnSubmit);
             document.getElementById('modalForm').addEventListener('submit', handleModalSubmit);
+            
+            // 添加搜索下拉框事件监听器
+            setupSearchDropdown('borrowUserInput', 'borrowUserDropdown', 'borrowUserId', 'user');
+            setupSearchDropdown('borrowBookInput', 'borrowBookDropdown', 'borrowBookId', 'book');
+            setupSearchDropdown('returnUserInput', 'returnUserDropdown', 'returnUserId', 'user');
+            setupSearchDropdown('returnBookInput', 'returnBookDropdown', 'returnBookId', 'book');
         });
         
         // 弹出卡片相关函数
